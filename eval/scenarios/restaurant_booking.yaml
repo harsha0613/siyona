@@ -1,0 +1,21 @@
+name: restaurant_booking
+description: >
+  Call a restaurant, clear a two-option IVR, and book a table for four at 7pm.
+  Exercises DTMF navigation, slot filling, and a clean task_complete hangup.
+callee_number: "+15551234567"
+instruction: Book a table for four at Bella Vista tonight at 7pm under the name Siyona.
+latency_budget_ms: 300
+
+turns:
+  - callee_says: "Thanks for calling Bella Vista. For reservations, press one."
+    expect: send_dtmf
+  - callee_says: "Reservations, how many in your party?"
+    expect: four
+  - callee_says: "And what time would you like?"
+    expect: seven
+  - callee_says: "Can I get a name for the booking?"
+    expect: Siyona
+  - callee_says: "Great, you are booked. Anything else?"
+    expect: end_call
+
+expected_outcome: task_complete
