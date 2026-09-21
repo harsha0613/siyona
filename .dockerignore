@@ -1,0 +1,9 @@
+.git
+.github
+web/node_modules
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.venv
+infra/terraform/.terraform
