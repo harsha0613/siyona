@@ -1,0 +1,106 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --text: #e6e8ee;
+  --muted: #9aa3b2;
+  --accent: #6ea8fe;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) 1fr;
+  gap: 24px;
+}
+
+@media (max-width: 720px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.task-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-list button {
+  width: 100%;
+  text-align: left;
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 6px;
+}
+
+.task-list button.selected {
+  border-color: var(--accent);
+}
+
+.badge {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.transcript {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 16px;
+}
+
+.transcript header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.transcript ol {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.turn {
+  display: grid;
+  grid-template-columns: 72px 1fr auto;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.turn--agent .speaker {
+  color: var(--accent);
+}
+
+.speaker,
+.latency,
+.meta {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.error {
+  color: #ff8a8a;
+}
