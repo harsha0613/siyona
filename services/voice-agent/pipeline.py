@@ -1,10 +1,32 @@
-"""Real-time voice pipeline: Deepgram STT -> GPT-4.1 -> Cartesia TTS.
+"""Real-time call loop: streaming Deepgram STT -> GPT-4.1 -> streaming Cartesia TTS.
 
-This module is the streaming skeleton for the Siyona voice agent. The three
-vendor clients sit behind small interfaces and the implementations used here
-are in-memory mocks, so the loop runs end to end with no API keys.
+One :class:`CallPipeline` runs per call. It only talks to the protocols in
+``vendors/base.py``; the live adapters and the in-memory mocks are
+interchangeable, and :func:`vendors.factory.build_vendors` picks the mocks
+whenever API keys are absent, so this runs end to end with no keys.
 
-Run it directly for a demo conversation:
+Streaming, stage by stage:
+
+* **Partial transcripts reach the model early.** While the callee is still
+  talking, each interim transcript (after a short debounce) starts a
+  *speculative* model request. If the final transcript matches the last
+  speculation, that already-running stream becomes the reply, so the model has
+  been working since before the callee stopped. If it doesn't match, the
+  speculation is cancelled and its vendor stream closed.
+* **TTS streams.** Model tokens are cut at phrase boundaries and fed into TTS
+  while the model is still generating, so audio starts before the sentence is
+  complete.
+* **Teardown is total.** However the call ends (hang-up, error, cancellation),
+  every in-flight model stream, TTS stream, timer and vendor socket is closed.
+
+Latency is measured per turn as three contiguous intervals, so they sum to the
+silence the callee experiences:
+
+    stt_ms    end of callee speech   -> final transcript   (endpointing)
+    model_ms  final transcript       -> first phrase handed to TTS
+    tts_ms    first phrase to TTS    -> first agent audio sent to the line
+
+Run it directly for an offline demo conversation:
 
     python services/voice-agent/pipeline.py
 """
@@ -12,16 +34,45 @@ Run it directly for a demo conversation:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import re
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from typing import Any
+
+from vendors.base import (
+    AudioOut,
+    LanguageModel,
+    LlmEvent,
+    SpeechToText,
+    TextDelta,
+    TextToSpeech,
+    ToolCallRequest,
+    UsageReport,
+)
+from vendors.mock import (
+    MockLanguageModel,
+    MockTextToSpeech,
+    RecordingAudioOut,
+    ScriptedSpeechToText,
+)
 
 logger = logging.getLogger("siyona.voice_agent.pipeline")
 
-# Budget for one full turn (caller stops speaking -> first audio byte out).
+# Budget for one full turn (callee stops speaking -> first agent audio).
 TARGET_TURN_LATENCY_MS = 300.0
+# Interim transcripts shorter than this aren't worth a speculative request.
+MIN_SPECULATION_WORDS = 2
+# Wait this long for the interim transcript to settle before speculating.
+SPECULATION_DEBOUNCE_S = 0.15
+
+SYSTEM_PROMPT = (
+    "You are Siyona, an AI assistant on a live phone call on behalf of a customer. "
+    "Say that you are an AI assistant calling on someone's behalf. Speak naturally and "
+    "keep every reply to one or two short sentences."
+)
 
 
 @dataclass
@@ -49,209 +100,301 @@ class StageTimings:
         }
 
 
-class _Stopwatch:
-    """Context manager accumulating wall time into one StageTimings field."""
-
-    def __init__(self, timings: StageTimings, field_name: str) -> None:
-        self._timings = timings
-        self._field = field_name
-        self._start = 0.0
-
-    def __enter__(self) -> _Stopwatch:
-        self._start = time.perf_counter()
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        elapsed_ms = (time.perf_counter() - self._start) * 1000.0
-        setattr(self._timings, self._field, getattr(self._timings, self._field) + elapsed_ms)
-
-
-@dataclass
-class Transcript:
-    """A partial or final transcript emitted by the STT socket."""
-
-    text: str
-    is_final: bool
-
-
-# ---------------------------------------------------------------------------
-# Mock vendor clients
-# ---------------------------------------------------------------------------
-
-
-class MockDeepgramSocket:
-    """Stand-in for a Deepgram streaming websocket.
-
-    Emits interim transcripts followed by a final one, mimicking the partial
-    results that let the model start planning before the caller stops talking.
-    """
-
-    def __init__(self, utterances: list[str], chunk_delay_s: float = 0.005) -> None:
-        self._utterances = list(utterances)
-        self._chunk_delay_s = chunk_delay_s
-        self.closed = False
-
-    async def stream(self) -> AsyncIterator[Transcript]:
-        for utterance in self._utterances:
-            words = utterance.split()
-            for idx in range(1, len(words)):
-                await asyncio.sleep(self._chunk_delay_s)
-                yield Transcript(text=" ".join(words[:idx]), is_final=False)
-            await asyncio.sleep(self._chunk_delay_s)
-            yield Transcript(text=utterance, is_final=True)
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class MockLanguageModel:
-    """Stand-in for GPT-4.1 with tool calling, streaming tokens back."""
-
-    def __init__(self, token_delay_s: float = 0.002) -> None:
-        self._token_delay_s = token_delay_s
-        self.seen_partials: list[str] = []
-
-    def observe_partial(self, transcript: Transcript) -> None:
-        """Warm the model with interim transcripts (speculative planning)."""
-        self.seen_partials.append(transcript.text)
-
-    async def stream_reply(
-        self, transcript: str, history: list[dict[str, str]]
-    ) -> AsyncIterator[str]:
-        reply = self._plan_reply(transcript, history)
-        for token in reply.split():
-            await asyncio.sleep(self._token_delay_s)
-            yield token + " "
-
-    @staticmethod
-    def _plan_reply(transcript: str, history: list[dict[str, str]]) -> str:
-        lowered = transcript.lower()
-        if "press" in lowered or "menu" in lowered:
-            return "Understood, selecting that option now."
-        if "name" in lowered:
-            return "I am calling on behalf of a customer to confirm their booking."
-        if "goodbye" in lowered or "bye" in lowered:
-            return "Thank you for your help. Goodbye."
-        return f"Got it. Continuing on turn {len(history) // 2 + 1}."
-
-
-class MockCartesiaTTS:
-    """Stand-in for Cartesia streaming TTS; yields audio frames as they render."""
-
-    def __init__(self, frame_delay_s: float = 0.002) -> None:
-        self._frame_delay_s = frame_delay_s
-
-    async def stream_audio(self, tokens: AsyncIterator[str]) -> AsyncIterator[bytes]:
-        async for token in tokens:
-            await asyncio.sleep(self._frame_delay_s)
-            yield token.encode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TurnResult:
     caller_text: str
     agent_text: str
     audio_bytes: int
     timings: StageTimings
+    speculative_hit: bool = False
+
+
+class SentenceChunker:
+    """Groups streamed tokens into speakable phrases.
+
+    The first phrase is released at the earliest clause boundary so audio starts
+    quickly; later ones wait for a longer phrase so prosody stays natural.
+    """
+
+    BOUNDARY = re.compile(r"[.!?;:,](?=\s)|\n")
+
+    def __init__(self, first_min_chars: int = 12, min_chars: int = 40) -> None:
+        self._buffer = ""
+        self._first_min = first_min_chars
+        self._min = min_chars
+        self._emitted = False
+
+    def feed(self, text: str) -> list[str]:
+        self._buffer += text
+        chunks: list[str] = []
+        while True:
+            threshold = self._min if self._emitted else self._first_min
+            cut = None
+            for match in self.BOUNDARY.finditer(self._buffer):
+                if match.end() >= threshold:
+                    cut = match.end()
+                    break
+            if cut is None:
+                return chunks
+            chunk, self._buffer = self._buffer[:cut], self._buffer[cut:]
+            if chunk.strip():
+                chunks.append(chunk)
+                self._emitted = True
+
+    def flush(self) -> str | None:
+        chunk, self._buffer = self._buffer, ""
+        return chunk if chunk.strip() else None
+
+
+def normalise(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s']", " ", text.lower()).split())
+
+
+class _Generation:
+    """One model request, drained into a queue so it can run ahead of its consumer."""
+
+    def __init__(self, llm: LanguageModel, messages: list[dict[str, Any]], text: str) -> None:
+        self.text = text
+        self.key = normalise(text)
+        self._queue: asyncio.Queue[LlmEvent | BaseException | None] = asyncio.Queue()
+        self._task = asyncio.create_task(self._pump(llm, messages))
+
+    async def _pump(self, llm: LanguageModel, messages: list[dict[str, Any]]) -> None:
+        try:
+            async with contextlib.aclosing(llm.stream(messages, [])) as events:  # type: ignore[type-var]
+                async for event in events:
+                    self._queue.put_nowait(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._queue.put_nowait(exc)
+            return
+        self._queue.put_nowait(None)
+
+    async def events(self) -> AsyncIterator[LlmEvent]:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    async def cancel(self) -> None:
+        if not self._task.done():
+            self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
 
 
 @dataclass
-class VoicePipeline:
+class CallPipeline:
     """Wires STT -> LLM -> TTS into a single streaming conversation loop."""
 
-    stt: MockDeepgramSocket
-    llm: MockLanguageModel
-    tts: MockCartesiaTTS
-    history: list[dict[str, str]] = field(default_factory=list)
+    stt: SpeechToText
+    llm: LanguageModel
+    tts: TextToSpeech
+    audio_out: AudioOut
+    system_prompt: str = SYSTEM_PROMPT
+    speculate: bool = True
+    speculation_debounce_s: float = SPECULATION_DEBOUNCE_S
+    clock: Callable[[], float] = time.perf_counter
+    history: list[dict[str, Any]] = field(default_factory=list)
     turns: list[TurnResult] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._speculation: _Generation | None = None
+        self._debounce: asyncio.Task[None] | None = None
+        self._closed = False
+
+    # ------------------------------------------------------------------ loop
+
     async def run(self) -> list[TurnResult]:
-        async for turn in self.stream_turns():
-            self.turns.append(turn)
+        try:
+            await asyncio.gather(self.stt.start(), self.tts.start())
+            async with contextlib.aclosing(self.stt.events()) as events:  # type: ignore[type-var]
+                async for event in events:
+                    if event.kind == "interim":
+                        self._on_interim(event.text)
+                    elif event.kind == "final" and event.text.strip():
+                        await self._respond(event.text.strip(), event.speech_ended_at)
+        finally:
+            await self.aclose()
         return self.turns
 
-    async def stream_turns(self) -> AsyncIterator[TurnResult]:
-        timings = StageTimings()
-        stt_watch = _Stopwatch(timings, "stt_ms")
-        stt_watch.__enter__()
+    def _messages(self, caller_text: str) -> list[dict[str, Any]]:
+        return [
+            {"role": "system", "content": self.system_prompt},
+            *self.history,
+            {"role": "user", "content": caller_text},
+        ]
 
-        async for transcript in self.stt.stream():
-            if not transcript.is_final:
-                self.llm.observe_partial(transcript)
-                continue
+    # ----------------------------------------------------------- speculation
 
-            stt_watch.__exit__()
-            yield await self._handle_final(transcript.text, timings)
+    def _on_interim(self, text: str) -> None:
+        observe = getattr(self.llm, "observe_partial", None)
+        if observe is not None:
+            observe(text)
+        if not self.speculate or len(text.split()) < MIN_SPECULATION_WORDS:
+            return
+        if self._debounce is not None and not self._debounce.done():
+            self._debounce.cancel()
+        self._debounce = asyncio.create_task(self._speculate_after(text))
 
-            timings = StageTimings()
-            stt_watch = _Stopwatch(timings, "stt_ms")
-            stt_watch.__enter__()
+    async def _speculate_after(self, text: str) -> None:
+        if self.speculation_debounce_s:
+            await asyncio.sleep(self.speculation_debounce_s)
+        if self._speculation is not None and self._speculation.key == normalise(text):
+            return
+        await self._drop_speculation()
+        self._speculation = _Generation(self.llm, self._messages(text), text)
+        logger.debug("speculating on %d interim words", len(text.split()))
 
-        stt_watch.__exit__()
-        await self.stt.close()
+    async def _drop_speculation(self) -> None:
+        speculation, self._speculation = self._speculation, None
+        if speculation is not None:
+            await speculation.cancel()
 
-    async def _handle_final(self, caller_text: str, timings: StageTimings) -> TurnResult:
-        self.history.append({"role": "caller", "content": caller_text})
+    async def _cancel_debounce(self) -> None:
+        debounce, self._debounce = self._debounce, None
+        if debounce is not None and not debounce.done():
+            debounce.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await debounce
 
-        tokens: list[str] = []
-        audio_chunks: list[bytes] = []
+    async def _generation_for(self, caller_text: str) -> tuple[_Generation, bool]:
+        await self._cancel_debounce()
+        speculation, self._speculation = self._speculation, None
+        if speculation is not None and speculation.key == normalise(caller_text):
+            return speculation, True
+        if speculation is not None:
+            await speculation.cancel()
+        return _Generation(self.llm, self._messages(caller_text), caller_text), False
 
-        with _Stopwatch(timings, "model_ms"):
-            async for token in self.llm.stream_reply(caller_text, self.history):
-                tokens.append(token)
+    # ------------------------------------------------------------------ turn
 
-        with _Stopwatch(timings, "tts_ms"):
-            async for chunk in self.tts.stream_audio(_aiter(tokens)):
-                audio_chunks.append(chunk)
-
-        agent_text = "".join(tokens).strip()
-        self.history.append({"role": "agent", "content": agent_text})
-
-        self._log_turn(caller_text, agent_text, timings)
-        return TurnResult(
-            caller_text=caller_text,
-            agent_text=agent_text,
-            audio_bytes=sum(len(chunk) for chunk in audio_chunks),
-            timings=timings,
+    async def _respond(self, caller_text: str, speech_end: float | None) -> TurnResult:
+        t_final = self.clock()
+        timings = StageTimings(
+            stt_ms=max(0.0, (t_final - speech_end) * 1000.0) if speech_end is not None else 0.0
         )
+        generation, hit = await self._generation_for(caller_text)
+
+        text_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        first_chunk: list[float] = []
+        first_audio: list[float] = []
+        speak_task = asyncio.create_task(self._speak(text_queue, first_audio))
+        chunker = SentenceChunker()
+        parts: list[str] = []
+
+        def hand_to_tts(chunk: str) -> None:
+            if not first_chunk:
+                first_chunk.append(self.clock())
+            text_queue.put_nowait(chunk)
+
+        try:
+            async for event in generation.events():
+                if isinstance(event, TextDelta):
+                    parts.append(event.text)
+                    for chunk in chunker.feed(event.text):
+                        hand_to_tts(chunk)
+                elif isinstance(event, ToolCallRequest):
+                    logger.warning("model requested tool %s; tools are not enabled", event.name)
+                elif isinstance(event, UsageReport):
+                    pass
+            tail = chunker.flush()
+            if tail:
+                hand_to_tts(tail)
+            text_queue.put_nowait(None)
+            audio_bytes = await speak_task
+        finally:
+            if not speak_task.done():
+                speak_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await speak_task
+            await generation.cancel()
+
+        if first_chunk:
+            timings.model_ms = (first_chunk[0] - t_final) * 1000.0
+        if first_chunk and first_audio:
+            timings.tts_ms = (first_audio[0] - first_chunk[0]) * 1000.0
+
+        agent_text = "".join(parts).strip()
+        self.history.append({"role": "user", "content": caller_text})
+        if agent_text:
+            self.history.append({"role": "assistant", "content": agent_text})
+        turn = TurnResult(caller_text, agent_text, audio_bytes, timings, speculative_hit=hit)
+        self.turns.append(turn)
+        self._log_turn(turn)
+        return turn
+
+    async def _speak(self, text_queue: asyncio.Queue[str | None], first_audio: list[float]) -> int:
+        async def text_stream() -> AsyncIterator[str]:
+            while True:
+                chunk = await text_queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+
+        sent = 0
+        async with contextlib.aclosing(self.tts.synthesize(text_stream())) as stream:  # type: ignore[type-var]
+            async for audio in stream:
+                if not first_audio:
+                    first_audio.append(self.clock())
+                sent += len(audio)
+                await self.audio_out.send_audio(audio)
+        return sent
 
     @staticmethod
-    def _log_turn(caller_text: str, agent_text: str, timings: StageTimings) -> None:
-        breakdown = timings.as_dict()
+    def _log_turn(turn: TurnResult) -> None:
+        breakdown = turn.timings.as_dict()
         logger.info(
-            "turn complete caller=%r agent=%r stt=%.1fms model=%.1fms "
-            "tts=%.1fms total=%.1fms budget=%s",
-            caller_text,
-            agent_text,
+            "turn complete stt=%.1fms model=%.1fms tts=%.1fms total=%.1fms budget=%s "
+            "speculative=%s",
             breakdown["stt_ms"],
             breakdown["model_ms"],
             breakdown["tts_ms"],
             breakdown["total_ms"],
-            "ok" if timings.within_budget else "EXCEEDED",
+            "ok" if turn.timings.within_budget else "EXCEEDED",
+            turn.speculative_hit,
         )
 
+    # -------------------------------------------------------------- teardown
 
-async def _aiter(items: list[str]) -> AsyncIterator[str]:
-    for item in items:
-        yield item
+    async def aclose(self) -> None:
+        """Release everything the call holds. Safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._cancel_debounce()
+        await self._drop_speculation()
+        for vendor in (self.stt, self.tts, self.llm):
+            close = getattr(vendor, "close", None)
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception:
+                logger.exception("closing %s failed", type(vendor).__name__)
 
 
-@asynccontextmanager
-async def demo_pipeline(utterances: list[str]) -> AsyncIterator[VoicePipeline]:
-    pipeline = VoicePipeline(
-        stt=MockDeepgramSocket(utterances),
-        llm=MockLanguageModel(),
-        tts=MockCartesiaTTS(),
+# Backwards-compatible name from the scaffold.
+VoicePipeline = CallPipeline
+
+
+@contextlib.asynccontextmanager
+async def demo_pipeline(utterances: list[str]) -> AsyncIterator[CallPipeline]:
+    pipeline = CallPipeline(
+        stt=ScriptedSpeechToText(utterances, word_delay_s=0.01, endpoint_delay_s=0.02),
+        llm=MockLanguageModel(token_delay_s=0.002),
+        tts=MockTextToSpeech(),
+        audio_out=RecordingAudioOut(),
+        speculation_debounce_s=0.0,
     )
     try:
         yield pipeline
     finally:
-        await pipeline.stt.close()
+        await pipeline.aclose()
 
 
 DEMO_UTTERANCES = [
