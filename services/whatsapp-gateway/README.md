@@ -4,7 +4,12 @@ Inbound WhatsApp handling and per-user session state.
 
 - `webhook.py` — `POST /webhook/whatsapp` verifies the `X-Hub-Signature-256`
   HMAC over the raw body, parses the Cloud API envelope, and creates a Task
-  stub. Bad or missing signature → `401`. Status callbacks → `200 ignored`.
+  stub with the raw text and sender. Bad or missing signature → `403`, nothing
+  written. A message we can't act on → error logged and a clarification prompt
+  sent to the sender. Status callbacks → `200 ignored`.
+- `whatsapp.py` — outbound sender. `CloudApiClient` when
+  `WHATSAPP_ACCESS_TOKEN` is set, otherwise `MockWhatsApp` (records, never sends).
+- `messages.py` — every user-facing message text in one place.
 
 ```bash
 uvicorn webhook:app --app-dir services/whatsapp-gateway --reload
