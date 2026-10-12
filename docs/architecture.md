@@ -38,6 +38,17 @@ long-lived stateful socket per call, and the API is ordinary CRUD.
 6. On `end_call`, the orchestrator consolidates every attempt into one
    `Outcome`, which the gateway sends back to the user on WhatsApp.
 
+### Status updates
+
+The `StatusNotifier` (`services/orchestrator/notifier.py`) sends exactly one
+end-of-call message per task: the agent's plain-language summary on success, or
+the failure type (no answer / busy / hung up / couldn't connect). Outcomes come
+from the voice agent (success + summary) and from the vendor's status callback
+at `POST /telephony/status`, which the `Telephony` adapter verifies and
+translates into a vendor-neutral `CallOutcome`; a forged callback is a 403.
+If a call is still running `EXPECTED_CALL_WINDOW_S` after dialling, the user
+gets one "still on the line" update.
+
 ## Telephony provider boundary
 
 The telephony vendor sits behind one interface in

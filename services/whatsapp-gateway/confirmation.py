@@ -65,6 +65,10 @@ class Dialer(Protocol):
         ...
 
 
+class CallWatcher(Protocol):
+    def call_started(self, task: Task) -> None: ...
+
+
 def timeout_from_env() -> float:
     return float(os.environ.get("CONFIRMATION_TIMEOUT_S", DEFAULT_TIMEOUT_S))
 
@@ -83,9 +87,11 @@ class ConfirmationGate:
         dialer: Dialer,
         timeout_s: float | None = None,
         clock: Callable[[], datetime] = utcnow,
+        watcher: CallWatcher | None = None,
     ) -> None:
         self._sender = sender
         self._dialer = dialer
+        self._watcher = watcher
         self.timeout = timedelta(seconds=timeout_s if timeout_s is not None else timeout_from_env())
         self._clock = clock
 
@@ -170,6 +176,8 @@ class ConfirmationGate:
             await self._send(task.user_phone, messages.CALL_NOT_STARTED)
             return
         await self._send(task.user_phone, messages.CALLING_NOW)
+        if self._watcher is not None:
+            self._watcher.call_started(task)
 
     async def expire_overdue(self) -> int:
         """Cancel every task whose confirmation window has passed. Returns how many."""
