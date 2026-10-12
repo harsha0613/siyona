@@ -98,10 +98,21 @@ callee audio ──▶ Deepgram socket ──▶ interim transcripts ──▶ m
                                                       audio to callee
 ```
 
-Interim transcripts are fed to the model as they arrive so it can plan before
-the caller stops speaking; only the final transcript commits a turn. Tokens are
-handed to TTS as they are produced rather than after the full reply, so audio
-starts before the sentence is finished.
+Interim transcripts reach the model before the caller stops speaking: once an
+interim result settles (`SPECULATION_DEBOUNCE_S`), the pipeline starts a
+*speculative* model request on it. If the final transcript matches, that
+already-running stream becomes the reply; if not, it is cancelled and its
+vendor stream closed. Tokens are cut at phrase boundaries (`SentenceChunker`)
+and handed to TTS as they are produced, so audio starts before the sentence is
+finished.
+
+Every vendor sits behind a protocol in `services/voice-agent/vendors/base.py`
+(`SpeechToText`, `LanguageModel`, `TextToSpeech`, `AudioOut`).
+`vendors/factory.py` picks the live Deepgram / OpenAI / Cartesia adapter per
+stage when its key is set and the in-memory mock otherwise. When a call ends
+(hang-up, error or cancellation) `CallPipeline.aclose()` cancels any
+speculative request and debounce timer and closes every vendor stream and
+socket.
 
 `StageTimings` wraps each stage in a stopwatch and logs
 `stt / model / tts / total` per turn, flagging any turn over the budget.
