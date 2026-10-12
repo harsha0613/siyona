@@ -8,6 +8,10 @@ to end.
   talking; model tokens are chunked into phrases and streamed into TTS while
   the model is still generating; `aclose()` releases every stream, timer and
   socket however the call ends. Each turn logs an STT / model / TTS breakdown.
+- `latency.py` — per-turn stopwatch: logs the STT / model / TTS breakdown for
+  every turn, warns on turns over `SLOW_TURN_MS` (500 ms) naming the slowest
+  stage, and logs a median / p95 summary per call. The pipeline plays a cached
+  filler if a vendor stalls past `STALL_FILLER_MS`.
 - `vendors/` — `base.py` holds the protocols; `deepgram.py`, `openai_llm.py`
   and `cartesia.py` are the live adapters; `mock.py` holds in-memory stand-ins;
   `factory.py` picks live or mock per stage from the environment (mock when

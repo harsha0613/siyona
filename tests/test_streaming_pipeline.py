@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from pipeline import CallPipeline, SentenceChunker, normalise
+from pipeline import FILLER_TEXT, CallPipeline, SentenceChunker, normalise
 from vendors.base import SttEvent
 from vendors.mock import (
     MockLanguageModel,
@@ -28,6 +28,11 @@ def _pipeline(stt, llm=None, tts=None, **kwargs) -> CallPipeline:
         audio_out=RecordingAudioOut(),
         **kwargs,
     )
+
+
+def _reply_calls(tts: MockTextToSpeech) -> list:
+    """TTS calls for replies, leaving out the filler synthesised at call start."""
+    return [call for call in tts.calls if call[0] != [FILLER_TEXT]]
 
 
 def _leftover_tasks() -> list[asyncio.Task]:
@@ -104,9 +109,10 @@ def test_audio_starts_before_the_model_finishes() -> None:
     pipeline = CallPipeline(stt=stt, llm=llm, tts=tts, audio_out=audio, speculate=False)
     [turn] = asyncio.run(pipeline.run())
 
-    assert tts.first_audio_at[0] < llm.finished_at[0]
-    assert len(tts.spoken) > 1, "reply was synthesised in one piece"
-    assert "".join(tts.spoken).strip() == LONG_REPLY
+    [(chunks, first_audio_at)] = _reply_calls(tts)
+    assert first_audio_at < llm.finished_at[0]
+    assert len(chunks) > 1, "reply was synthesised in one piece"
+    assert "".join(chunks).strip() == LONG_REPLY
     assert turn.audio_bytes == audio.total_bytes > 0
 
 
@@ -166,7 +172,7 @@ def test_teardown_when_the_call_is_cancelled_mid_reply() -> None:
 
     async def run() -> list:
         task = asyncio.create_task(_pipeline(stt, llm, tts, speculate=False).run())
-        while not tts.spoken:
+        while not _reply_calls(tts):
             await asyncio.sleep(0.005)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

@@ -174,6 +174,8 @@ class MockTextToSpeech:
         self._delay = first_audio_delay_s
         self.spoken: list[str] = []
         self.first_audio_at: list[float] = []
+        # One entry per synthesize() call: (text chunks, time of its first audio).
+        self.calls: list[tuple[list[str], float | None]] = []
         self.open_streams = 0
         self.started = False
         self.closed = False
@@ -181,16 +183,26 @@ class MockTextToSpeech:
     async def start(self) -> None:
         self.started = True
 
+    def first_audio_delay(self, call_index: int) -> float:
+        return self._delay
+
     async def synthesize(self, text: AsyncIterator[str]) -> AsyncIterator[bytes]:
         self.open_streams += 1
+        chunks: list[str] = []
+        self.calls.append((chunks, None))
+        index = len(self.calls) - 1
         try:
             first = True
             async for chunk in text:
-                if first and self._delay:
-                    await precise_sleep(self._delay)
+                delay = self.first_audio_delay(index) if first else 0.0
+                if delay:
+                    await precise_sleep(delay)
                 self.spoken.append(chunk)
+                chunks.append(chunk)
                 if first:
-                    self.first_audio_at.append(time.perf_counter())
+                    now = time.perf_counter()
+                    self.first_audio_at.append(now)
+                    self.calls[index] = (chunks, now)
                 first = False
                 words = max(1, len(chunk.split()))
                 yield MULAW_SILENCE * (60 * BYTES_PER_MS * words)
