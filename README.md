@@ -6,9 +6,23 @@ for four at Bella Vista tonight at 7pm"* — and Siyona dials the number,
 navigates the IVR, holds a natural conversation with whoever picks up, and
 reports back an outcome plus the full transcript.
 
-> **Status: scaffold.** This is an Assignment-3 deliverable. The structure,
-> contracts and CI are real; the vendor integrations are mocked so everything
-> here runs with no API keys.
+> **Status: Sprint 1 implemented.** The Sprint 1 stories are implemented:
+>
+> - **WhatsApp intake**: HMAC-verified webhook that turns a message into a task
+>   (bad signature → 403, unreadable message → clarification prompt).
+> - **Confirmation gate**: a who / what / when summary that the user must
+>   confirm before anything is dialled. NO or timeout cancels it.
+> - **Status updates**: an outcome message when the call completes or fails
+>   (no answer / busy / hung up), plus a "still on the line" update when a call
+>   runs long.
+> - **Streaming voice pipeline**: Deepgram → GPT-4.1 → Cartesia, with partial
+>   transcripts reaching the model early and TTS streaming as the model writes.
+> - **Latency instrumentation**: per-turn STT / model / TTS breakdown, slow-turn
+>   warnings over 500 ms, and a filler instead of silence on a vendor stall.
+>
+> Every vendor (telephony, WhatsApp, STT, LLM, TTS) sits behind an interface
+> and falls back to an in-memory mock when its key is unset. Local runs and CI
+> need no API keys.
 
 ## Architecture
 
@@ -25,11 +39,12 @@ WhatsApp  ──▶  whatsapp-gateway  ──▶  orchestrator  ──▶  voice
                      web  (React review dashboard)
 ```
 
-The voice agent is a fully streaming loop. Deepgram emits interim transcripts
-that warm the model before the caller finishes speaking; the model streams
-tokens straight into Cartesia, which streams audio back onto the call. Every
-turn is wrapped in a stopwatch that logs an STT / model / TTS breakdown against
-a **median turn latency target of ≤ 300 ms**.
+The voice agent is a fully streaming loop. Deepgram's interim transcripts start
+speculative model requests before the caller finishes speaking; the model
+streams tokens straight into Cartesia, which streams audio back onto the call.
+Every turn is wrapped in a stopwatch that logs an STT / model / TTS breakdown
+against a **median turn latency target of ≤ 300 ms**, and turns over 500 ms are
+flagged with their stage breakdown.
 
 Read more in [docs/architecture.md](docs/architecture.md).
 
@@ -37,9 +52,9 @@ Read more in [docs/architecture.md](docs/architecture.md).
 
 | Path | What lives there |
 | --- | --- |
-| `services/whatsapp-gateway/` | Inbound webhook, HMAC signature check, session state |
-| `services/voice-agent/` | Streaming STT → LLM → TTS pipeline and the tool layer |
-| `services/orchestrator/` | Task fan-out, call state machine, outcome consolidation |
+| `services/whatsapp-gateway/` | Inbound webhook, HMAC signature check, intake, confirmation gate |
+| `services/voice-agent/` | Streaming STT → LLM → TTS pipeline, vendor adapters, latency instrumentation, telephony interface |
+| `services/orchestrator/` | Call dispatch, WhatsApp status updates, call state machine |
 | `services/api/` | Accounts, tasks, transcripts, retention (SQLAlchemy models) |
 | `web/` | React + TypeScript review dashboard |
 | `eval/` | Scenario files and the evaluation harness |

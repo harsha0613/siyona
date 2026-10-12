@@ -18,9 +18,13 @@ Streaming, stage by stage:
   complete.
 * **Teardown is total.** However the call ends (hang-up, error, cancellation),
   every in-flight model stream, TTS stream, timer and vendor socket is closed.
+* **No dead air on a vendor stall.** If no reply audio has gone out
+  ``STALL_FILLER_MS`` after the final transcript, a short filler ("One moment,
+  please.") is played from audio synthesised at call start, so it works even
+  when TTS itself is the stalled vendor.
 
 Latency is measured per turn as three contiguous intervals, so they sum to the
-silence the callee experiences:
+silence the callee experiences (see ``latency.py``):
 
     stt_ms    end of callee speech   -> final transcript   (endpointing)
     model_ms  final transcript       -> first phrase handed to TTS
@@ -36,12 +40,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from latency import (
+    TARGET_TURN_LATENCY_MS,
+    StageTimings,
+    TurnStopwatch,
+    log_call_summary,
+    log_turn,
+    slow_turn_ms_from_env,
+)
 from vendors.base import (
     AudioOut,
     LanguageModel,
@@ -61,12 +74,15 @@ from vendors.mock import (
 
 logger = logging.getLogger("siyona.voice_agent.pipeline")
 
-# Budget for one full turn (callee stops speaking -> first agent audio).
-TARGET_TURN_LATENCY_MS = 300.0
+__all__ = ["TARGET_TURN_LATENCY_MS", "CallPipeline", "StageTimings", "TurnResult"]
+
 # Interim transcripts shorter than this aren't worth a speculative request.
 MIN_SPECULATION_WORDS = 2
 # Wait this long for the interim transcript to settle before speculating.
 SPECULATION_DEBOUNCE_S = 0.15
+# Play a filler if no reply audio has gone out this long after the final transcript.
+DEFAULT_STALL_FILLER_MS = 800.0
+FILLER_TEXT = "One moment, please."
 
 SYSTEM_PROMPT = (
     "You are Siyona, an AI assistant on a live phone call on behalf of a customer. "
@@ -75,29 +91,8 @@ SYSTEM_PROMPT = (
 )
 
 
-@dataclass
-class StageTimings:
-    """Per-stage stopwatch for a single conversational turn."""
-
-    stt_ms: float = 0.0
-    model_ms: float = 0.0
-    tts_ms: float = 0.0
-
-    @property
-    def total_ms(self) -> float:
-        return self.stt_ms + self.model_ms + self.tts_ms
-
-    @property
-    def within_budget(self) -> bool:
-        return self.total_ms <= TARGET_TURN_LATENCY_MS
-
-    def as_dict(self) -> dict[str, float]:
-        return {
-            "stt_ms": round(self.stt_ms, 1),
-            "model_ms": round(self.model_ms, 1),
-            "tts_ms": round(self.tts_ms, 1),
-            "total_ms": round(self.total_ms, 1),
-        }
+def stall_filler_s_from_env() -> float:
+    return float(os.environ.get("STALL_FILLER_MS", DEFAULT_STALL_FILLER_MS)) / 1000.0
 
 
 @dataclass
@@ -107,6 +102,7 @@ class TurnResult:
     audio_bytes: int
     timings: StageTimings
     speculative_hit: bool = False
+    filler_played: bool = False
 
 
 class SentenceChunker:
@@ -198,6 +194,9 @@ class CallPipeline:
     system_prompt: str = SYSTEM_PROMPT
     speculate: bool = True
     speculation_debounce_s: float = SPECULATION_DEBOUNCE_S
+    slow_turn_ms: float = field(default_factory=slow_turn_ms_from_env)
+    stall_filler_s: float = field(default_factory=stall_filler_s_from_env)
+    filler_text: str = FILLER_TEXT
     clock: Callable[[], float] = time.perf_counter
     history: list[dict[str, Any]] = field(default_factory=list)
     turns: list[TurnResult] = field(default_factory=list)
@@ -205,6 +204,8 @@ class CallPipeline:
     def __post_init__(self) -> None:
         self._speculation: _Generation | None = None
         self._debounce: asyncio.Task[None] | None = None
+        self._filler_audio: bytes | None = None
+        self._filler_task: asyncio.Task[None] | None = None
         self._closed = False
 
     # ------------------------------------------------------------------ loop
@@ -212,6 +213,7 @@ class CallPipeline:
     async def run(self) -> list[TurnResult]:
         try:
             await asyncio.gather(self.stt.start(), self.tts.start())
+            self._filler_task = asyncio.create_task(self._prepare_filler())
             async with contextlib.aclosing(self.stt.events()) as events:  # type: ignore[type-var]
                 async for event in events:
                     if event.kind == "interim":
@@ -274,22 +276,18 @@ class CallPipeline:
     # ------------------------------------------------------------------ turn
 
     async def _respond(self, caller_text: str, speech_end: float | None) -> TurnResult:
-        t_final = self.clock()
-        timings = StageTimings(
-            stt_ms=max(0.0, (t_final - speech_end) * 1000.0) if speech_end is not None else 0.0
-        )
+        watch = TurnStopwatch(speech_end, self.clock)
         generation, hit = await self._generation_for(caller_text)
 
         text_queue: asyncio.Queue[str | None] = asyncio.Queue()
-        first_chunk: list[float] = []
-        first_audio: list[float] = []
-        speak_task = asyncio.create_task(self._speak(text_queue, first_audio))
+        speak_task = asyncio.create_task(self._speak(text_queue, watch))
+        filler_played: list[bool] = []
+        watchdog = asyncio.create_task(self._filler_if_stalled(watch, filler_played))
         chunker = SentenceChunker()
         parts: list[str] = []
 
         def hand_to_tts(chunk: str) -> None:
-            if not first_chunk:
-                first_chunk.append(self.clock())
+            watch.mark_first_chunk()
             text_queue.put_nowait(chunk)
 
         try:
@@ -308,27 +306,37 @@ class CallPipeline:
             text_queue.put_nowait(None)
             audio_bytes = await speak_task
         finally:
-            if not speak_task.done():
-                speak_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await speak_task
+            for task in (speak_task, watchdog):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
             await generation.cancel()
 
-        if first_chunk:
-            timings.model_ms = (first_chunk[0] - t_final) * 1000.0
-        if first_chunk and first_audio:
-            timings.tts_ms = (first_audio[0] - first_chunk[0]) * 1000.0
-
+        timings = watch.timings()
         agent_text = "".join(parts).strip()
         self.history.append({"role": "user", "content": caller_text})
         if agent_text:
             self.history.append({"role": "assistant", "content": agent_text})
-        turn = TurnResult(caller_text, agent_text, audio_bytes, timings, speculative_hit=hit)
+        turn = TurnResult(
+            caller_text,
+            agent_text,
+            audio_bytes,
+            timings,
+            speculative_hit=hit,
+            filler_played=bool(filler_played),
+        )
         self.turns.append(turn)
-        self._log_turn(turn)
+        log_turn(
+            timings,
+            turn_index=len(self.turns),
+            slow_turn_ms=self.slow_turn_ms,
+            filler_played=turn.filler_played,
+            speculative_hit=hit,
+        )
         return turn
 
-    async def _speak(self, text_queue: asyncio.Queue[str | None], first_audio: list[float]) -> int:
+    async def _speak(self, text_queue: asyncio.Queue[str | None], watch: TurnStopwatch) -> int:
         async def text_stream() -> AsyncIterator[str]:
             while True:
                 chunk = await text_queue.get()
@@ -339,25 +347,45 @@ class CallPipeline:
         sent = 0
         async with contextlib.aclosing(self.tts.synthesize(text_stream())) as stream:  # type: ignore[type-var]
             async for audio in stream:
-                if not first_audio:
-                    first_audio.append(self.clock())
+                watch.mark_first_audio()
                 sent += len(audio)
                 await self.audio_out.send_audio(audio)
         return sent
 
-    @staticmethod
-    def _log_turn(turn: TurnResult) -> None:
-        breakdown = turn.timings.as_dict()
-        logger.info(
-            "turn complete stt=%.1fms model=%.1fms tts=%.1fms total=%.1fms budget=%s "
-            "speculative=%s",
-            breakdown["stt_ms"],
-            breakdown["model_ms"],
-            breakdown["tts_ms"],
-            breakdown["total_ms"],
-            "ok" if turn.timings.within_budget else "EXCEEDED",
-            turn.speculative_hit,
+    # ---------------------------------------------------------------- filler
+
+    async def _synthesize(self, text: str) -> bytes:
+        async def one() -> AsyncIterator[str]:
+            yield text
+
+        audio = b""
+        async with contextlib.aclosing(self.tts.synthesize(one())) as stream:  # type: ignore[type-var]
+            async for chunk in stream:
+                audio += chunk
+        return audio
+
+    async def _prepare_filler(self) -> None:
+        """Synthesise the filler once, off the critical path, so a TTS stall can't block it."""
+        try:
+            self._filler_audio = await self._synthesize(self.filler_text) or None
+        except Exception:
+            logger.warning("could not pre-synthesise the filler", exc_info=True)
+
+    async def _filler_if_stalled(self, watch: TurnStopwatch, played: list[bool]) -> None:
+        await asyncio.sleep(self.stall_filler_s)
+        if watch.has_audio:
+            return
+        logger.warning(
+            "no reply audio %.0fms after the caller finished; playing a filler",
+            watch.elapsed_ms(),
         )
+        audio = self._filler_audio
+        if audio is None:
+            # Not cached yet (or TTS failed at start): best effort, live.
+            audio = await self._synthesize(self.filler_text)
+        if audio and not watch.has_audio:
+            await self.audio_out.send_audio(audio)
+            played.append(True)
 
     # -------------------------------------------------------------- teardown
 
@@ -368,6 +396,12 @@ class CallPipeline:
         self._closed = True
         await self._cancel_debounce()
         await self._drop_speculation()
+        filler, self._filler_task = self._filler_task, None
+        if filler is not None and not filler.done():
+            filler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await filler
+        log_call_summary([turn.timings.total_ms for turn in self.turns])
         for vendor in (self.stt, self.tts, self.llm):
             close = getattr(vendor, "close", None)
             if close is None:

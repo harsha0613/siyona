@@ -114,8 +114,26 @@ stage when its key is set and the in-memory mock otherwise. When a call ends
 speculative request and debounce timer and closes every vendor stream and
 socket.
 
-`StageTimings` wraps each stage in a stopwatch and logs
-`stt / model / tts / total` per turn, flagging any turn over the budget.
+### Latency instrumentation
+
+`services/voice-agent/latency.py` stamps four moments in every turn with a
+`TurnStopwatch`:
+
+```
+speech_end ──stt──▶ final transcript ──model──▶ first phrase to TTS ──tts──▶ first audio out
+```
+
+The three stages are contiguous, so `stt + model + tts` is exactly the silence
+the callee hears. Every turn is logged with that breakdown (also attached to
+the log record as structured `latency` data). A turn slower than
+`SLOW_TURN_MS` (default 500 ms) is logged as a **warning** naming the slowest
+stage, and each call ends with a median / p95 summary line.
+
+**Vendor stalls don't produce dead air.** A short filler ("One moment,
+please.") is synthesised once at call start, off the critical path. If no reply
+audio has gone out `STALL_FILLER_MS` (default 800 ms) after the final
+transcript, whether the model or TTS is the slow stage, the cached filler is
+played and the real reply follows when it arrives.
 
 ### Latency budget
 
