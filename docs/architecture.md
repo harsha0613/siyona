@@ -4,7 +4,7 @@
 
 | Service | Responsibility | Key module |
 | --- | --- | --- |
-| `whatsapp-gateway` | Verify the inbound HMAC signature, parse the message envelope, create a Task, hold per-user session state | `webhook.py` |
+| `whatsapp-gateway` | Verify the inbound HMAC signature, parse the message envelope, create a Task, hold per-user session state, send replies | `webhook.py`, `whatsapp.py` |
 | `orchestrator` | Fan a task out across candidate numbers, drive the call state machine, consolidate results into one outcome | `state_machine.py` |
 | `voice-agent` | The real-time STT → LLM → TTS loop and the tool layer the model calls during a call | `pipeline.py`, `tools.py` |
 | `api` | Accounts, tasks, calls, transcripts, outcomes, retention | `models.py` |
@@ -18,9 +18,12 @@ long-lived stateful socket per call, and the API is ordinary CRUD.
 
 1. WhatsApp POSTs to `/webhook/whatsapp`. The gateway recomputes the
    `X-Hub-Signature-256` HMAC over the raw body and compares it in constant
-   time. A bad or missing signature is a 401 and nothing is created.
-2. A valid text message becomes a `Task` (status `received`). Status callbacks
-   and non-text messages are acknowledged and ignored, not retried.
+   time. A bad or missing signature is a 403 and nothing is created or sent.
+2. A valid text message becomes a `Task` (status `received`) holding the raw
+   text and the sender. A message we can't act on (non-text, empty, missing
+   fields) is logged and the sender gets a clarification prompt. Delivery and
+   read receipts carry no message and are acknowledged without a reply. A
+   malformed envelope is logged and rejected with a 400.
 3. The orchestrator fans the task out into one or more `CallAttempt`s, each
    moving through `queued → dialing → in_ivr → connected → completed`. Illegal
    transitions raise rather than silently corrupting state; `failed → queued` is

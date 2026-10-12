@@ -4,6 +4,13 @@ Validates the provider's HMAC-SHA256 signature, parses the inbound message
 envelope, and creates a Task stub that the orchestrator will pick up. The task
 store is in-memory here; the real service writes through to the API service.
 
+- Valid signature + text message: a Task is created with the raw text and the
+  sender.
+- Invalid or missing signature: 403, and nothing is written.
+- A message we can't act on (non-text, empty, missing fields): the error is
+  logged and the sender is asked to clarify. Delivery/read receipts carry no
+  message and are acknowledged without a reply.
+
 Run locally:
 
     uvicorn webhook:app --app-dir services/whatsapp-gateway --reload
@@ -13,13 +20,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import messages
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
+from whatsapp import WhatsAppSender, build_whatsapp
+
+logger = logging.getLogger("siyona.gateway.webhook")
 
 SIGNATURE_HEADER = "X-Hub-Signature-256"
 SIGNATURE_PREFIX = "sha256="
@@ -78,19 +90,62 @@ class MessageParseError(ValueError):
     """The payload did not contain a text message we can act on."""
 
 
-def parse_message(payload: dict[str, Any]) -> tuple[str, str]:
-    """Pull ``(from_phone, text)`` out of a WhatsApp Cloud API envelope."""
-    try:
-        value = payload["entry"][0]["changes"][0]["value"]
-        message = value["messages"][0]
-        from_phone = message["from"]
-        text = message["text"]["body"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise MessageParseError("no text message in payload") from exc
+@dataclass
+class InboundMessage:
+    """One user message from the envelope. ``error`` is set when we can't act on it."""
 
-    if not isinstance(text, str) or not text.strip():
-        raise MessageParseError("empty message body")
-    return from_phone, text.strip()
+    sender: str | None
+    text: str | None
+    message_id: str | None = None
+    error: str | None = None
+
+
+def _inbound(message: Any) -> InboundMessage:
+    if not isinstance(message, dict):
+        return InboundMessage(None, None, error="message is not an object")
+    sender = message.get("from")
+    sender = str(sender) if sender else None
+    message_id = message.get("id")
+    if sender is None:
+        return InboundMessage(None, None, message_id, "message has no sender")
+    kind = message.get("type", "text")
+    if kind != "text":
+        return InboundMessage(sender, None, message_id, f"unsupported message type {kind!r}")
+    text_obj = message.get("text")
+    body = text_obj.get("body") if isinstance(text_obj, dict) else None
+    if not isinstance(body, str):
+        return InboundMessage(sender, None, message_id, "text message has no body")
+    if not body.strip():
+        return InboundMessage(sender, None, message_id, "empty message body")
+    return InboundMessage(sender, body, message_id)
+
+
+def parse_messages(payload: Any) -> list[InboundMessage]:
+    """Every user message in a (possibly batched) Cloud API envelope.
+
+    Raises :class:`MessageParseError` if the envelope itself is malformed.
+    Returns an empty list for notifications that carry no message (receipts).
+    """
+    if not isinstance(payload, dict):
+        raise MessageParseError("payload is not an object")
+    found: list[InboundMessage] = []
+    try:
+        for entry in payload.get("entry") or []:
+            for change in entry.get("changes") or []:
+                value = change.get("value") or {}
+                for message in value.get("messages") or []:
+                    found.append(_inbound(message))
+    except (AttributeError, TypeError) as exc:
+        raise MessageParseError("malformed envelope") from exc
+    return found
+
+
+def parse_message(payload: dict[str, Any]) -> tuple[str, str]:
+    """``(sender, text)`` of the first actionable text message. Raises if there is none."""
+    for message in parse_messages(payload):
+        if message.error is None and message.sender and message.text:
+            return message.sender, message.text.strip()
+    raise MessageParseError("no text message in payload")
 
 
 def create_task(user_phone: str, instruction: str) -> Task:
@@ -100,6 +155,15 @@ def create_task(user_phone: str, instruction: str) -> Task:
     return task
 
 
+async def _ask_to_clarify(sender: WhatsAppSender, to: str) -> bool:
+    try:
+        await sender.send_text(to, messages.CLARIFY)
+    except Exception:
+        logger.exception("could not send clarification prompt")
+        return False
+    return True
+
+
 @router.post("/webhook/whatsapp")
 async def receive_message(
     request: Request,
@@ -107,21 +171,34 @@ async def receive_message(
 ) -> dict[str, Any]:
     body = await request.body()
     if not verify_signature(body, x_hub_signature_256):
-        raise HTTPException(status_code=401, detail="invalid signature")
+        logger.warning("rejected webhook with invalid signature")
+        raise HTTPException(status_code=403, detail="invalid signature")
 
     try:
         payload = await request.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="malformed JSON") from exc
+        inbound = parse_messages(payload)
+    except (ValueError, MessageParseError) as exc:
+        # No trustworthy sender to reply to; log it and tell Meta not to retry.
+        logger.error("malformed webhook payload: %s", exc)
+        raise HTTPException(status_code=400, detail="malformed payload") from exc
 
-    try:
-        user_phone, instruction = parse_message(payload)
-    except MessageParseError as exc:
-        # Status callbacks and non-text messages are acknowledged, not retried.
-        return {"status": "ignored", "reason": str(exc)}
+    if not inbound:
+        # Delivery/read receipts and other notifications: acknowledge, don't retry.
+        return {"status": "ignored", "tasks": [], "clarified": 0}
 
-    task = create_task(user_phone, instruction)
-    return {"status": "accepted", "task": task.as_dict()}
+    sender: WhatsAppSender = request.app.state.whatsapp
+    tasks: list[dict[str, Any]] = []
+    clarified = 0
+    for message in inbound:
+        if message.error is None and message.sender and message.text:
+            tasks.append(create_task(message.sender, message.text).as_dict())
+            continue
+        logger.error("could not act on inbound message %s: %s", message.message_id, message.error)
+        if message.sender and await _ask_to_clarify(sender, message.sender):
+            clarified += 1
+
+    status = "accepted" if tasks else "clarification_requested"
+    return {"status": status, "tasks": tasks, "clarified": clarified}
 
 
 @router.get("/healthz")
@@ -129,8 +206,9 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def create_app() -> FastAPI:
+def create_app(whatsapp: WhatsAppSender | None = None) -> FastAPI:
     application = FastAPI(title="Siyona WhatsApp Gateway", version="0.1.0")
+    application.state.whatsapp = whatsapp or build_whatsapp()
     application.include_router(router)
     return application
 
