@@ -49,9 +49,10 @@ class TaskStatus(StrEnum):
     """Lifecycle of a user instruction."""
 
     RECEIVED = "received"
+    NEEDS_USER_INPUT = "needs_user_input"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
     QUEUED = "queued"
     IN_PROGRESS = "in_progress"
-    NEEDS_USER_INPUT = "needs_user_input"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

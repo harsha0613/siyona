@@ -7,8 +7,10 @@ import logging
 
 import pytest
 import webhook
+from dispatcher import CallDispatcher
 from fastapi.testclient import TestClient
 from messages import CLARIFY
+from telephony import MockTelephony
 from webhook import SIGNATURE_HEADER, compute_signature, create_app, parse_message
 from whatsapp import MockWhatsApp
 
@@ -51,7 +53,7 @@ def outbox() -> MockWhatsApp:
 def client(monkeypatch: pytest.MonkeyPatch, outbox: MockWhatsApp) -> TestClient:
     monkeypatch.setenv("WHATSAPP_APP_SECRET", SECRET)
     webhook.TASK_STORE.clear()
-    return TestClient(create_app(whatsapp=outbox))
+    return TestClient(create_app(whatsapp=outbox, dialer=CallDispatcher(MockTelephony(), "k")))
 
 
 def _signed_post(client: TestClient, payload):
@@ -85,10 +87,9 @@ def test_valid_signature_creates_task_with_raw_text_and_sender(
     [task] = data["tasks"]
     assert task["user_phone"] == "15550100001"
     assert task["instruction"] == raw
-    assert task["status"] == "received"
     [stored] = webhook.TASK_STORE.values()
     assert (stored.user_phone, stored.instruction) == ("15550100001", raw)
-    assert outbox.outbox == []
+    assert CLARIFY not in outbox.texts_to("15550100001")
 
 
 def test_bad_signature_returns_403(client: TestClient) -> None:
@@ -225,7 +226,7 @@ def test_clarification_send_failure_does_not_fail_the_webhook(
 
     monkeypatch.setenv("WHATSAPP_APP_SECRET", SECRET)
     webhook.TASK_STORE.clear()
-    client = TestClient(create_app(whatsapp=Broken()))
+    client = TestClient(create_app(whatsapp=Broken(), dialer=CallDispatcher(MockTelephony(), "k")))
     response = _signed_post(client, _message_envelope({"from": "15550100001", "type": "video"}))
 
     assert response.status_code == 200

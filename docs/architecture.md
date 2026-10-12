@@ -24,12 +24,18 @@ long-lived stateful socket per call, and the API is ordinary CRUD.
    fields) is logged and the sender gets a clarification prompt. Delivery and
    read receipts carry no message and are acknowledged without a reply. A
    malformed envelope is logged and rejected with a 400.
-3. The orchestrator fans the task out into one or more `CallAttempt`s, each
+3. **Confirmation gate.** Intake parses the text into who / what / when (numbers
+   only ever come from the user's own words) and sends that summary back. The
+   task waits in `awaiting_confirmation`: YES moves it to `in_progress` and the
+   dispatcher places the call through the `Telephony` interface; NO, or no
+   reply within `CONFIRMATION_TIMEOUT_S`, cancels it and nothing is dialled. A
+   request with no number waits in `needs_user_input` until the user sends one.
+4. The orchestrator fans the task out into one or more `CallAttempt`s, each
    moving through `queued → dialing → in_ivr → connected → completed`. Illegal
    transitions raise rather than silently corrupting state; `failed → queued` is
    the only retry edge, bounded by `MAX_ATTEMPTS_PER_NUMBER`.
-4. The voice agent opens a media stream and runs the turn loop below.
-5. On `end_call`, the orchestrator consolidates every attempt into one
+5. The voice agent opens a media stream and runs the turn loop below.
+6. On `end_call`, the orchestrator consolidates every attempt into one
    `Outcome`, which the gateway sends back to the user on WhatsApp.
 
 ## Telephony provider boundary
