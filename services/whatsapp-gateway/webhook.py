@@ -18,18 +18,25 @@ Run locally:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import logging
 import os
-import uuid
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import messages
+from confirmation import ConfirmationGate, Dialer
+from dispatcher import build_dispatcher
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
+from tasks import TASK_STORE, Task, create_task
 from whatsapp import WhatsAppSender, build_whatsapp
+
+__all__ = ["TASK_STORE", "Task", "create_task", "create_app", "parse_message", "parse_messages"]
 
 logger = logging.getLogger("siyona.gateway.webhook")
 
@@ -60,30 +67,6 @@ def verify_signature(body: bytes, header_value: str | None, secret: str | None =
     if not header_value or not header_value.startswith(SIGNATURE_PREFIX):
         return False
     return hmac.compare_digest(compute_signature(body, secret), header_value)
-
-
-@dataclass
-class Task:
-    """Minimal task stub created from an inbound WhatsApp message."""
-
-    id: str
-    user_phone: str
-    instruction: str
-    status: str = "received"
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "user_phone": self.user_phone,
-            "instruction": self.instruction,
-            "status": self.status,
-            "created_at": self.created_at.isoformat(),
-        }
-
-
-# Session state keyed by task id. Replaced by Redis + the API service in R2.
-TASK_STORE: dict[str, Task] = {}
 
 
 class MessageParseError(ValueError):
@@ -148,13 +131,6 @@ def parse_message(payload: dict[str, Any]) -> tuple[str, str]:
     raise MessageParseError("no text message in payload")
 
 
-def create_task(user_phone: str, instruction: str) -> Task:
-    """Create and store a Task stub for the orchestrator to fan out."""
-    task = Task(id=str(uuid.uuid4()), user_phone=user_phone, instruction=instruction)
-    TASK_STORE[task.id] = task
-    return task
-
-
 async def _ask_to_clarify(sender: WhatsAppSender, to: str) -> bool:
     try:
         await sender.send_text(to, messages.CLARIFY)
@@ -187,17 +163,29 @@ async def receive_message(
         return {"status": "ignored", "tasks": [], "clarified": 0}
 
     sender: WhatsAppSender = request.app.state.whatsapp
+    gate: ConfirmationGate = request.app.state.gate
     tasks: list[dict[str, Any]] = []
+    replies = 0
     clarified = 0
     for message in inbound:
         if message.error is None and message.sender and message.text:
-            tasks.append(create_task(message.sender, message.text).as_dict())
+            if await gate.handle_reply(message.sender, message.text):
+                replies += 1
+                continue
+            task = create_task(message.sender, message.text)
+            await gate.open(task)
+            tasks.append(task.as_dict())
             continue
         logger.error("could not act on inbound message %s: %s", message.message_id, message.error)
         if message.sender and await _ask_to_clarify(sender, message.sender):
             clarified += 1
 
-    status = "accepted" if tasks else "clarification_requested"
+    if tasks:
+        status = "accepted"
+    elif replies:
+        status = "reply_handled"
+    else:
+        status = "clarification_requested"
     return {"status": status, "tasks": tasks, "clarified": clarified}
 
 
@@ -206,9 +194,28 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def create_app(whatsapp: WhatsAppSender | None = None) -> FastAPI:
-    application = FastAPI(title="Siyona WhatsApp Gateway", version="0.1.0")
-    application.state.whatsapp = whatsapp or build_whatsapp()
+def create_app(
+    whatsapp: WhatsAppSender | None = None,
+    dialer: Dialer | None = None,
+    confirmation_timeout_s: float | None = None,
+) -> FastAPI:
+    sender = whatsapp or build_whatsapp()
+    gate = ConfirmationGate(sender, dialer or build_dispatcher(), confirmation_timeout_s)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        stop = asyncio.Event()
+        sweeper = asyncio.create_task(gate.run_expiry_loop(stop))
+        try:
+            yield
+        finally:
+            stop.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper
+
+    application = FastAPI(title="Siyona WhatsApp Gateway", version="0.1.0", lifespan=lifespan)
+    application.state.whatsapp = sender
+    application.state.gate = gate
     application.include_router(router)
     return application
 
