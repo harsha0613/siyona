@@ -58,4 +58,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke test the image
-        run: docker run --rm siyona/services:ci python -c "import webhook, pipeline, tools, models, state_machine, telephony, confirmation, dispatcher; print('imports ok')"
+        run: docker run --rm siyona/services:ci python -c "import webhook, pipeline, tools, models, state_machine, telephony, confirmation, dispatcher, notifier; print('imports ok')"

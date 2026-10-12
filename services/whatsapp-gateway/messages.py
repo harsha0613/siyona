@@ -42,3 +42,41 @@ def confirmation_expired(minutes: int) -> str:
         f"I didn't hear back within {minutes} minutes, so I've cancelled that request and "
         "won't call. Send it again whenever you're ready."
     )
+
+
+# --- call status updates --------------------------------------------------------
+
+
+def _who(callee: str | None) -> str:
+    return callee or "them"
+
+
+def call_succeeded(summary: str | None, callee: str | None) -> str:
+    detail = (summary or "").strip() or f"The call with {_who(callee)} went through."
+    return f"✅ Done. {detail}"
+
+
+def call_no_answer(callee: str | None) -> str:
+    return f"📵 No one answered when I called {_who(callee)}. Nothing was done."
+
+
+def call_busy(callee: str | None) -> str:
+    return f"📵 The line was busy when I called {_who(callee)}. Nothing was done."
+
+
+def call_hung_up(callee: str | None) -> str:
+    who = callee or "They"
+    return f"📴 {who} hung up before anything was confirmed. Nothing was done."
+
+
+CALL_FAILED = (
+    "⚠️ Something went wrong on my side and the call didn't go through. Nothing was done. "
+    "Please try again later."
+)
+
+
+def still_on_the_line(callee: str | None) -> str:
+    return (
+        f"⏳ Still on the line with {_who(callee)}. It's taking longer than usual; "
+        "I'll message you as soon as it's done."
+    )

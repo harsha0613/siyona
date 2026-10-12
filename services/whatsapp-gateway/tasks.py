@@ -56,6 +56,10 @@ def create_task(user_phone: str, instruction: str) -> Task:
     return task
 
 
+def find_by_call_id(call_id: str) -> Task | None:
+    return next((task for task in TASK_STORE.values() if task.call_id == call_id), None)
+
+
 def latest_for(user_phone: str, *statuses: TaskStatus) -> Task | None:
     """The user's most recent task in one of ``statuses``."""
     matching = [

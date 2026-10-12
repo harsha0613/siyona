@@ -28,12 +28,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl
 
 import messages
 from confirmation import ConfirmationGate, Dialer
-from dispatcher import build_dispatcher
+from dispatcher import CallDispatcher, signing_key_from_env
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
-from tasks import TASK_STORE, Task, create_task
+from notifier import StatusNotifier
+from tasks import TASK_STORE, Task, create_task, find_by_call_id
+from telephony import STATUS_CALLBACK_PATH, Telephony, TelephonyError, build_telephony
 from whatsapp import WhatsAppSender, build_whatsapp
 
 __all__ = ["TASK_STORE", "Task", "create_task", "create_app", "parse_message", "parse_messages"]
@@ -189,6 +192,37 @@ async def receive_message(
     return {"status": status, "tasks": tasks, "clarified": clarified}
 
 
+def _public_url(request: Request) -> str:
+    """The URL the vendor signed: our public base, not what the load balancer forwarded."""
+    base = os.environ.get("GATEWAY_PUBLIC_URL", "").rstrip("/")
+    if not base:
+        return str(request.url)
+    query = f"?{request.url.query}" if request.url.query else ""
+    return f"{base}{request.url.path}{query}"
+
+
+@router.post(STATUS_CALLBACK_PATH)
+async def telephony_status(request: Request) -> dict[str, Any]:
+    """Call progress from the telephony vendor (verified by the adapter)."""
+    telephony: Telephony = request.app.state.telephony
+    params = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+    try:
+        progress = telephony.parse_status_callback(
+            _public_url(request), params, dict(request.headers)
+        )
+    except TelephonyError as exc:
+        logger.warning("rejected telephony status callback: %s", exc)
+        raise HTTPException(status_code=403, detail="invalid callback") from exc
+
+    task = find_by_call_id(progress.call_id)
+    if task is None:
+        return {"status": "unknown_call"}
+    if progress.outcome is not None:
+        notifier: StatusNotifier = request.app.state.notifier
+        await notifier.call_finished(task, progress.outcome)
+    return {"status": "ok"}
+
+
 @router.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -198,9 +232,14 @@ def create_app(
     whatsapp: WhatsAppSender | None = None,
     dialer: Dialer | None = None,
     confirmation_timeout_s: float | None = None,
+    expected_call_window_s: float | None = None,
 ) -> FastAPI:
     sender = whatsapp or build_whatsapp()
-    gate = ConfirmationGate(sender, dialer or build_dispatcher(), confirmation_timeout_s)
+    if dialer is None:
+        dialer = CallDispatcher(build_telephony(), signing_key_from_env())
+    telephony = getattr(dialer, "telephony", None) or build_telephony()
+    notifier = StatusNotifier(sender, expected_call_window_s)
+    gate = ConfirmationGate(sender, dialer, confirmation_timeout_s, watcher=notifier)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -212,10 +251,13 @@ def create_app(
             stop.set()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper
+            await notifier.aclose()
 
     application = FastAPI(title="Siyona WhatsApp Gateway", version="0.1.0", lifespan=lifespan)
     application.state.whatsapp = sender
     application.state.gate = gate
+    application.state.notifier = notifier
+    application.state.telephony = telephony
     application.include_router(router)
     return application
 

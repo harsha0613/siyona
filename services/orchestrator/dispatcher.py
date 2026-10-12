@@ -39,6 +39,9 @@ class CallDispatcher:
         logger.info("call %s placed for task %s", call_id, task.id)
 
 
+def signing_key_from_env() -> str:
+    return os.environ.get("LINK_SIGNING_KEY", DEV_LINK_SIGNING_KEY)
+
+
 def build_dispatcher() -> CallDispatcher:
-    key = os.environ.get("LINK_SIGNING_KEY", DEV_LINK_SIGNING_KEY)
-    return CallDispatcher(build_telephony(), key)
+    return CallDispatcher(build_telephony(), signing_key_from_env())
