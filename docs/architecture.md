@@ -29,6 +29,41 @@ long-lived stateful socket per call, and the API is ordinary CRUD.
 5. On `end_call`, the orchestrator consolidates every attempt into one
    `Outcome`, which the gateway sends back to the user on WhatsApp.
 
+## Telephony provider boundary
+
+The telephony vendor sits behind one interface in
+`services/voice-agent/telephony.py`. Nothing outside that module knows which
+vendor places the call.
+
+```
+orchestrator ──place_call(to, call_id, stream_token)──▶ Telephony (Protocol)
+             ◀────────────── provider call id ────────┤
+             ──hang_up(provider_call_sid)────────────▶ │
+                                                       ├── TwilioTelephony  (TELEPHONY_* set)
+                                                       └── MockTelephony    (default, no keys)
+```
+
+| Crosses the boundary | Stays inside the adapter |
+| --- | --- |
+| E.164 number to dial, our `call_id` | Vendor REST endpoints, auth, payload format |
+| A signed, expiring media-stream token | TwiML / call-control markup |
+| The provider's call id (opaque string) | Vendor status-callback and signature schemes |
+| `TelephonyError` on failure | Vendor-specific error codes |
+
+Rules for an adapter:
+
+- `place_call` returns as soon as the vendor accepts the call; progress arrives
+  later through the vendor's status callbacks.
+- `hang_up` on a call that is already over is a no-op, not an error.
+- The answered call's audio must be bridged to `/twilio/media` (or the vendor's
+  equivalent) carrying `call_id` and the stream token. The voice service rejects
+  any stream whose token fails `signing.verify(..., "media-stream", ...)`.
+- `build_telephony()` chooses the adapter from the environment. With no
+  credentials it returns `MockTelephony`, so CI and local runs never dial.
+
+Swapping vendors means adding one adapter class and one branch in
+`build_telephony()`; the orchestrator and voice pipeline do not change.
+
 ## The turn loop
 
 ```
