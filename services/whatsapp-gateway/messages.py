@@ -35,6 +35,7 @@ def confirm(goal: str, callee: str | None, display: str, when: str) -> str:
 CALLING_NOW = "📞 Calling now. I'll message you when I'm done."
 DECLINED = "Okay, I won't call. Send me something else whenever you like."
 CALL_NOT_STARTED = "Sorry, I couldn't start that call. Nothing was done; please try again later."
+ASSISTANT_UNAVAILABLE = "Sorry, I couldn't work that out just now. Please try again in a moment."
 
 
 def confirmation_expired(minutes: int) -> str:

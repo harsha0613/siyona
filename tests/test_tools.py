@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from assistant_tools import assistant_tool_schemas
 from tools import (
     END_CALL_REASONS,
     TOOL_REGISTRY,
@@ -22,7 +23,9 @@ def test_every_tool_is_registered_under_its_name() -> None:
     assert all(name == tool.name for name, tool in TOOL_REGISTRY.items())
 
 
-@pytest.mark.parametrize("schema", tool_schemas(), ids=lambda s: s["function"]["name"])
+@pytest.mark.parametrize(
+    "schema", tool_schemas() + assistant_tool_schemas(), ids=lambda s: s["function"]["name"]
+)
 def test_schema_shape_matches_the_model_api(schema: dict) -> None:
     assert schema["type"] == "function"
     function = schema["function"]
