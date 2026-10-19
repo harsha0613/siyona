@@ -7,6 +7,9 @@ WhatsApp reply. Before sending, any place id is scrubbed from the reply as a
 second line of defence; the tools never show ids to the model in the first
 place.
 
+A turn that opens a call confirmation sends only the gate's who / what / when
+summary; the call itself waits for the user's YES, exactly like a typed number.
+
 The assistant is on when ``OPENAI_API_KEY`` is set. Without a key the gateway
 keeps its rule-based intake, so local runs and CI need no keys.
 """
@@ -20,7 +23,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import messages
-from assistant_tools import ASSISTANT_TOOLS, AssistantTool, ToolContext, dispatch
+from assistant_tools import ASSISTANT_TOOLS, AssistantTool, Confirmer, ToolContext, dispatch
 from maps import Maps, build_maps
 from session import Session, session_for
 from tools import ToolError
@@ -47,6 +50,19 @@ one" is result 1. If a field is "Not available", say it is not available; never 
 - List at most 5 places, numbered, each with its name, rating and one short detail.
 - Never show internal identifiers. Refer to places by number or name.
 - Keep replies short; this is WhatsApp.
+
+CALLING A STORE
+- Offer to call a store you found. You never choose or type a phone number: \
+create_call_request dials the number Google lists for the place from the last \
+place_details lookup, so look the store up first.
+- Before create_call_request, ask the 2-3 most important questions for this kind of \
+business in ONE message (e.g. pharmacy: medication and strength, pickup or delivery; \
+restaurant: party size, date and time). Confirm the customer's name if you know it. Skip \
+anything already answered; if the user says "just call", call with what you have.
+- Put every answer in details. After create_call_request the user gets a confirmation \
+summary and must reply YES; do not repeat it.
+- After a call result, if the user wants more done (e.g. "yes, book it"), call \
+create_call_request again for the same store with the updated task and details.
 """
 
 # Google place ids: "ChIJ…" for most places, plus any "[place_id:…]" style leak.
@@ -63,8 +79,15 @@ def scrub_place_ids(text: str, known_ids: set[str]) -> str:
 
 
 def _context_prompt(session: Session) -> str:
-    location = session.location or "not saved yet"
-    return f"{ASSISTANT_PROMPT}\nCONTEXT\n- Saved address: {location}\n"
+    lines = [f"- Saved address: {session.location or 'not saved yet'}"]
+    if session.user_name:
+        lines.append(f"- Customer name (from WhatsApp): {session.user_name}")
+    if session.current_place is not None:
+        lines.append(f"- Place last looked up: {session.current_place.name}")
+    return f"{ASSISTANT_PROMPT}\nCONTEXT\n" + "\n".join(lines) + "\n"
+
+
+CONFIRMATION_SENT_NOTE = "(Sent the call confirmation summary; waiting for YES.)"
 
 
 def _tool_message(call: ToolCallRequest, result: dict[str, Any]) -> dict[str, Any]:
@@ -78,9 +101,12 @@ class Assistant:
         maps: Maps,
         tools: Sequence[AssistantTool] = ASSISTANT_TOOLS,
         max_rounds: int = MAX_TOOL_ROUNDS,
+        gate: Confirmer | None = None,
     ) -> None:
         self._llm = llm
         self.maps = maps
+        # Set by the gateway once its confirmation gate exists.
+        self.gate = gate
         self._schemas = [tool.as_openai_schema() for tool in tools]
         self._max_rounds = max_rounds
 
@@ -94,10 +120,16 @@ class Assistant:
             logger.warning("tool %s rejected: %s", call.name, exc)
             return {"status": "error", "message": str(exc)}
 
-    async def reply(self, user_phone: str, text: str) -> str:
-        """Run one model loop for ``text`` and return the WhatsApp reply."""
+    async def reply(self, user_phone: str, text: str, user_name: str | None = None) -> str:
+        """Run one model loop for ``text`` and return the WhatsApp reply.
+
+        Returns an empty string when a tool already messaged the user this turn (the
+        call confirmation summary), so the gateway sends nothing more.
+        """
         session = session_for(user_phone)
-        ctx = ToolContext(session, self.maps)
+        if user_name:
+            session.user_name = user_name
+        ctx = ToolContext(session, self.maps, self.gate)
         conversation: list[dict[str, Any]] = [
             {"role": "system", "content": _context_prompt(session)},
             *session.history,
@@ -112,6 +144,9 @@ class Assistant:
                 elif isinstance(event, ToolCallRequest):
                     calls.append(event)
             if not calls:
+                if ctx.confirmation_opened:
+                    session.remember(text, CONFIRMATION_SENT_NOTE)
+                    return ""
                 reply = scrub_place_ids("".join(parts), session.place_ids)
                 reply = reply or messages.ASSISTANT_UNAVAILABLE
                 session.remember(text, reply)

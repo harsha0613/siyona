@@ -12,6 +12,9 @@ on WhatsApp. The task then waits in ``AWAITING_CONFIRMATION``:
 
 If the instruction has no phone number, the task waits in ``NEEDS_USER_INPUT``
 for the user to send one, and then goes through the same gate.
+
+The WhatsApp assistant's ``create_call_request`` (a call to a store it found)
+enters the same gate through :meth:`ConfirmationGate.ask_to_confirm`.
 """
 
 from __future__ import annotations
@@ -110,9 +113,9 @@ class ConfirmationGate:
             task.status = TaskStatus.NEEDS_USER_INPUT
             await self._send(task.user_phone, messages.ask_number(spec.callee_name))
             return
-        await self._ask_to_confirm(task)
+        await self.ask_to_confirm(task)
 
-    async def _ask_to_confirm(self, task: Task) -> None:
+    async def ask_to_confirm(self, task: Task) -> None:
         task.status = TaskStatus.AWAITING_CONFIRMATION
         task.confirm_deadline = self._clock() + self.timeout
         summary = messages.confirm(
@@ -120,6 +123,7 @@ class ConfirmationGate:
             task.callee_name,
             display_number(task.numbers[0]),
             task.when or "as soon as possible",
+            task.details,
         )
         await self._send(task.user_phone, summary)
 
@@ -160,7 +164,7 @@ class ConfirmationGate:
             numbers = find_numbers(text, _region(user_phone))
             if numbers and len(_strip_numbers(text).split()) <= 6:
                 waiting.numbers = numbers[:3]
-                await self._ask_to_confirm(waiting)
+                await self.ask_to_confirm(waiting)
                 return True
             waiting.status = TaskStatus.CANCELLED
         return False

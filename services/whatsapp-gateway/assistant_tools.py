@@ -2,8 +2,12 @@
 
 Same contract as the call-time tools in ``tools.py`` (JSON Schema arguments, a
 handler returning a JSON-serialisable dict), with two differences: handlers are
-async, and each receives a :class:`ToolContext` holding the user's session and
-the Maps client.
+async, and each receives a :class:`ToolContext` holding the user's session, the
+Maps client and the confirmation gate.
+
+``create_call_request`` never takes a phone number from the model. It dials the
+number Place Details returned for the place last looked up, and only after the
+user has said YES to the confirmation summary.
 
 Place ids stay out of the model's view entirely. ``google_places`` returns
 numbered results and keeps the ids in the session, so the model can only refer
@@ -12,22 +16,35 @@ to a place it was actually shown, and has nothing to leak into a reply.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Protocol
 
 from maps import Maps, MapsError, Place, PlaceDetails
+from phone import PhoneNumberError, find_numbers, region_of, whatsapp_to_e164
 from session import Session
+from state_machine import MAX_ATTEMPTS_PER_NUMBER
+from tasks import Task, create_task
 from tools import Tool, ToolError
 
 MAX_LOCATION_CHARS = 200
 MAX_QUERY_CHARS = 120
 
 
-@dataclass(frozen=True)
+class Confirmer(Protocol):
+    async def ask_to_confirm(self, task: Task) -> None:
+        """Send the who / what / when summary; nothing is dialled until YES."""
+        ...
+
+
+@dataclass
 class ToolContext:
     session: Session
     maps: Maps
+    gate: Confirmer | None = None
+    # Set when a tool sent the user a confirmation summary during this turn.
+    confirmation_opened: bool = False
 
 
 @dataclass(frozen=True)
@@ -224,6 +241,105 @@ async def place_details(ctx: ToolContext, place: str) -> dict[str, Any]:
     return details_result(details)
 
 
+# ---------------------------------------------------------------------------
+# create_call_request
+# ---------------------------------------------------------------------------
+
+MAX_TASK_CHARS = 300
+MAX_DETAILS_CHARS = 1000
+
+CREATE_CALL_REQUEST_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task": {
+            "type": "string",
+            "description": (
+                "What to get done on the call, in one line, e.g. 'Ask whether they have "
+                "amoxicillin 500 mg in stock and hold it for pickup today'."
+            ),
+            "maxLength": MAX_TASK_CHARS,
+        },
+        "details": {
+            "type": "string",
+            "description": (
+                "Everything the store may need, as the user gave it: the customer's name, "
+                "the item or service, dates and times, preferences. Never invent any of it."
+            ),
+            "maxLength": MAX_DETAILS_CHARS,
+        },
+        "questions_asked": {
+            "type": "boolean",
+            "description": (
+                "True once you have asked the user the 2-3 most important questions for this "
+                "call and have their answers, or they told you to just call."
+            ),
+        },
+    },
+    "required": ["task", "details", "questions_asked"],
+    "additionalProperties": False,
+}
+
+
+def max_attempts_from_env() -> int:
+    return int(os.environ.get("MAX_ATTEMPTS_PER_NUMBER", MAX_ATTEMPTS_PER_NUMBER))
+
+
+def dialable_number(details: PlaceDetails, user_phone: str) -> str | None:
+    """The E.164 number Google lists for the place, or None. Never anything else."""
+    try:
+        region = region_of(whatsapp_to_e164(user_phone))
+    except PhoneNumberError:
+        region = None
+    for listed in (details.international_phone, details.phone):
+        if listed:
+            numbers = find_numbers(listed, region)
+            if numbers:
+                return numbers[0]
+    return None
+
+
+async def create_call_request(
+    ctx: ToolContext, task: str, details: str, questions_asked: bool
+) -> dict[str, Any]:
+    """Prepare a call to the place last looked up and ask the user to confirm it."""
+    goal = _text(task, "task", MAX_TASK_CHARS)
+    details = _text(details, "details", MAX_DETAILS_CHARS)
+    if questions_asked is not True:
+        return {
+            "status": "ask_first",
+            "message": (
+                "Ask the user the 2-3 most important questions for this call in one message, "
+                "then call create_call_request with their answers."
+            ),
+        }
+    place = ctx.session.current_place
+    if place is None:
+        return {"status": "need_place", "message": "Look the store up with place_details first."}
+    number = dialable_number(place, ctx.session.user_phone)
+    if number is None:
+        return {
+            "status": "no_phone",
+            "message": f"Google has no phone number for {place.name}, so it can't be called.",
+        }
+    if ctx.gate is None:
+        return {"status": "error", "message": "Calling isn't available right now."}
+
+    session = ctx.session
+    call = create_task(session.user_phone, goal)
+    call.goal, call.callee_name, call.numbers = goal, place.name, [number]
+    call.details, call.place_id = details, place.place_id
+    call.user_name, call.user_location = session.user_name, session.location
+    call.max_attempts = max(1, max_attempts_from_env())
+    if session.last_call_place_id == place.place_id:
+        call.follow_up_of = session.last_call_task_id
+    await ctx.gate.ask_to_confirm(call)
+    ctx.confirmation_opened = True
+    return {
+        "status": "awaiting_confirmation",
+        "message": "The user was sent the call summary and must reply YES before it is dialled.",
+    }
+
+
 ASSISTANT_TOOLS: tuple[AssistantTool, ...] = (
     AssistantTool(
         name="set_user_location",
@@ -252,6 +368,16 @@ ASSISTANT_TOOLS: tuple[AssistantTool, ...] = (
         ),
         parameters=PLACE_DETAILS_PARAMETERS,
         handler=place_details,
+    ),
+    AssistantTool(
+        name="create_call_request",
+        description=(
+            "Call the store from the last place_details lookup on the user's behalf. Only use "
+            "it after asking the 2-3 key questions for the call. The user is sent a summary "
+            "and nothing is dialled until they reply YES."
+        ),
+        parameters=CREATE_CALL_REQUEST_PARAMETERS,
+        handler=create_call_request,
     ),
 )
 

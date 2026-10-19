@@ -32,6 +32,15 @@ class Task:
     numbers: list[str] = field(default_factory=list)
     when: str | None = None
     confirm_deadline: datetime | None = None
+    # Set when the call is to a place the assistant found (Places), not a typed number.
+    place_id: str | None = None
+    details: str | None = None
+    user_name: str | None = None
+    user_location: str | None = None
+    follow_up_of: str | None = None
+    # Busy / no-answer / failed calls are redialled up to max_attempts times.
+    attempt: int = 1
+    max_attempts: int = 1
     # Filled in once the call is placed.
     call_id: str | None = None
     provider_call_sid: str | None = None

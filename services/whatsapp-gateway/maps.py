@@ -29,7 +29,8 @@ PLACES_BASE_URL = "https://maps.googleapis.com/maps/api/place"
 MAX_RESULTS = 5
 MAX_REVIEWS = 3
 DETAILS_FIELDS = (
-    "place_id,name,formatted_address,formatted_phone_number,website,opening_hours,"
+    "place_id,name,formatted_address,formatted_phone_number,international_phone_number,"
+    "website,opening_hours,"
     "rating,price_level,reviews,url"
 )
 
@@ -65,6 +66,8 @@ class PlaceDetails:
     name: str
     address: str | None = None
     phone: str | None = None
+    # Same number with the country code ("+1 508-555-0142"): what a call dials.
+    international_phone: str | None = None
     website: str | None = None
     opening_hours: tuple[str, ...] = ()
     rating: float | None = None
@@ -128,6 +131,7 @@ def _details(place_id: str, result: dict[str, Any]) -> PlaceDetails:
         name=str(result.get("name") or ""),
         address=result.get("formatted_address") or None,
         phone=result.get("formatted_phone_number") or None,
+        international_phone=result.get("international_phone_number") or None,
         website=result.get("website") or None,
         opening_hours=tuple(str(day) for day in weekday_text or ()),
         rating=result.get("rating"),

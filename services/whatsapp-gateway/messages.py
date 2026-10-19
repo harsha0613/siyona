@@ -17,19 +17,16 @@ def ask_number(callee: str | None) -> str:
     )
 
 
-def confirm(goal: str, callee: str | None, display: str, when: str) -> str:
+def confirm(
+    goal: str, callee: str | None, display: str, when: str, details: str | None = None
+) -> str:
     """The who / what / when summary the user must approve before anything is dialled."""
     who = f"{callee} on {display}" if callee else display
-    return "\n".join(
-        [
-            "Before I call, please check:",
-            f"• Who: {who}",
-            f"• What: {goal}",
-            f"• When: {when}",
-            "",
-            "Reply YES to call or NO to cancel.",
-        ]
-    )
+    lines = ["Before I call, please check:", f"• Who: {who}", f"• What: {goal}"]
+    if details:
+        lines.append(f"• I'll tell them: {details}")
+    lines += [f"• When: {when}", "", "Reply YES to call or NO to cancel."]
+    return "\n".join(lines)
 
 
 CALLING_NOW = "📞 Calling now. I'll message you when I'm done."
@@ -74,6 +71,27 @@ CALL_FAILED = (
     "⚠️ Something went wrong on my side and the call didn't go through. Nothing was done. "
     "Please try again later."
 )
+
+
+def retrying(
+    outcome: str, callee: str | None, attempt: int, max_attempts: int, minutes: int
+) -> str:
+    why = {"busy": "The line was busy", "no_answer": "No one answered"}.get(
+        outcome, "The call didn't go through"
+    )
+    return (
+        f"🔁 {why} when I called {_who(callee)}. I'll try again in about {minutes} min "
+        f"(attempt {attempt + 1} of {max_attempts})."
+    )
+
+
+_SPEAKERS = {"agent": "Siyona", "callee": "Them"}
+
+
+def call_transcript(lines: list[tuple[str, str]], callee: str | None) -> str:
+    who = callee or "the call"
+    body = "\n".join(f"{_SPEAKERS.get(speaker, speaker)}: {text}" for speaker, text in lines)
+    return f"📝 Transcript of {who}:\n{body}"
 
 
 def still_on_the_line(callee: str | None) -> str:
