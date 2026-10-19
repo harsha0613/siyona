@@ -136,6 +136,24 @@ Siyona:  Here's what I found near you:
          2. Park Avenue Drug (4.1★)
 ```
 
+### `place_details`
+
+Phone number, address, website, opening hours, rating, price level, up to
+three reviews and the Google Maps link for a place from the last search.
+"The first one", "#2" or "tell me more about Park Avenue Drug" resolve to the
+stored place id; an ambiguous or unknown name is refused rather than guessed.
+Any field Google doesn't have comes back as "Not available", never an invented
+value. Requires `GOOGLE_MAPS_API_KEY`.
+
+```
+User:    Tell me more about the first one
+Siyona:  Main Street Pharmacy, 12 Main St, Worcester MA
+         📞 (508) 555-0142
+         Mon–Sat 8:00 AM – 9:00 PM, Sun closed · 4.6★ · $$
+User:    And Park Avenue Drug's number?
+Siyona:  Their phone number is not available on Google.
+```
+
 ## Tech stack
 
 | Layer | Choice | Why |

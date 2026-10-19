@@ -1,9 +1,9 @@
 """Per-user conversation state for the WhatsApp assistant.
 
 What the assistant remembers between messages: the user's saved address, the
-last Places results (with their place_ids, which never reach the user), and a
-short message history. In-memory for now, like the task store; R2 moves it to
-Redis.
+last Places results (with their place_ids, which never reach the user), the
+place currently being discussed, and a short message history. In-memory for
+now, like the task store; R2 moves it to Redis.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from maps import Place
+from maps import Place, PlaceDetails
 
 MAX_HISTORY_MESSAGES = 20
 
@@ -21,6 +21,8 @@ class Session:
     user_phone: str
     location: str | None = None
     places: list[Place] = field(default_factory=list)
+    # The place last looked up with place_details: what "them" and "there" refer to.
+    current_place: PlaceDetails | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
 
     def remember(self, user_text: str, reply: str) -> None:
@@ -31,7 +33,10 @@ class Session:
 
     @property
     def place_ids(self) -> set[str]:
-        return {place.place_id for place in self.places}
+        ids = {place.place_id for place in self.places}
+        if self.current_place is not None:
+            ids.add(self.current_place.place_id)
+        return ids
 
 
 SESSIONS: dict[str, Session] = {}

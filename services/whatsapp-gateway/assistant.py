@@ -42,6 +42,8 @@ search finds nothing, say so.
 - To find or recommend any store, restaurant or service, call google_places. "Near me" \
 uses the saved address; if there is none, ask the user where they are.
 - When the user tells you where they are, call set_user_location before searching.
+- For a place's phone number, hours, website or reviews, call place_details. "The first \
+one" is result 1. If a field is "Not available", say it is not available; never fill it in.
 - List at most 5 places, numbered, each with its name, rating and one short detail.
 - Never show internal identifiers. Refer to places by number or name.
 - Keep replies short; this is WhatsApp.
