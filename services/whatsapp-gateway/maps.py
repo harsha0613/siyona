@@ -3,8 +3,8 @@
 The assistant only ever talks to the :class:`Maps` protocol, so the vendor is
 swappable and tests never touch the network:
 
-- :class:`GoogleMaps` — the Places Text Search and Place Details web services
-  over httpx.
+- :class:`GoogleMaps` — the Places Text Search, Place Details and Directions
+  web services over httpx.
 - :class:`MockMaps` — in-memory, returns only the places it was given. It is the
   default whenever ``GOOGLE_MAPS_API_KEY`` is unset or a placeholder, so local
   runs and CI need no key. With no places seeded it finds nothing: a keyless run
@@ -16,8 +16,10 @@ into an error message.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -26,6 +28,9 @@ import httpx
 logger = logging.getLogger("siyona.gateway.maps")
 
 PLACES_BASE_URL = "https://maps.googleapis.com/maps/api/place"
+DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
+TRAVEL_MODES = ("driving", "walking", "transit", "bicycling")
+MAX_STEPS = 5
 MAX_RESULTS = 5
 MAX_REVIEWS = 3
 DETAILS_FIELDS = (
@@ -76,6 +81,27 @@ class PlaceDetails:
     maps_url: str | None = None
 
 
+@dataclass(frozen=True)
+class RouteStep:
+    instruction: str
+    distance: str | None = None
+    duration: str | None = None
+
+
+@dataclass(frozen=True)
+class Route:
+    """The first leg of the best route Google returned."""
+
+    mode: str
+    distance: str
+    duration: str
+    start_address: str | None = None
+    end_address: str | None = None
+    # Driving only, when Google has live traffic for the trip.
+    duration_in_traffic: str | None = None
+    steps: tuple[RouteStep, ...] = ()
+
+
 class Maps(Protocol):
     async def text_search(self, query: str) -> list[Place]:
         """Places matching ``query`` (e.g. "pharmacy near 1 Main St, Worcester MA")."""
@@ -83,6 +109,13 @@ class Maps(Protocol):
 
     async def place_details(self, place_id: str) -> PlaceDetails:
         """Phone, hours, website, reviews and so on for one place."""
+        ...
+
+    async def directions(self, origin: str, destination: str, mode: str) -> Route | None:
+        """Distance, ETA and steps from ``origin`` to ``destination``; None if no route.
+
+        Either end may be an address, a place name, or ``place_id:<id>``.
+        """
         ...
 
 
@@ -141,16 +174,59 @@ def _details(place_id: str, result: dict[str, Any]) -> PlaceDetails:
     )
 
 
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _plain(instruction: str) -> str:
+    """Google's step instructions are HTML; WhatsApp wants plain text."""
+    text = _TAG.sub(" ", instruction.replace("<div", " <div"))
+    return " ".join(html.unescape(text).split())
+
+
+def _text_of(value: Any) -> str | None:
+    return value.get("text") or None if isinstance(value, dict) else None
+
+
+def _route(mode: str, body: dict[str, Any]) -> Route | None:
+    routes = body.get("routes") or []
+    legs = routes[0].get("legs") if routes and isinstance(routes[0], dict) else None
+    if not legs:
+        return None
+    leg = legs[0]
+    distance, duration = _text_of(leg.get("distance")), _text_of(leg.get("duration"))
+    if not distance or not duration:
+        return None
+    steps = tuple(
+        RouteStep(
+            instruction=_plain(str(step.get("html_instructions") or "")),
+            distance=_text_of(step.get("distance")),
+            duration=_text_of(step.get("duration")),
+        )
+        for step in (leg.get("steps") or [])[:MAX_STEPS]
+        if isinstance(step, dict) and step.get("html_instructions")
+    )
+    return Route(
+        mode=mode,
+        distance=distance,
+        duration=duration,
+        start_address=leg.get("start_address") or None,
+        end_address=leg.get("end_address") or None,
+        duration_in_traffic=_text_of(leg.get("duration_in_traffic")),
+        steps=steps,
+    )
+
+
 class GoogleMaps:
     def __init__(self, config: MapsConfig, http: httpx.AsyncClient | None = None) -> None:
         self._key = config.api_key
         self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
 
-    async def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+    async def _get(
+        self, path: str, params: dict[str, str], ok: tuple[str, ...] = ("OK", "ZERO_RESULTS")
+    ) -> dict[str, Any]:
+        url = path if path.startswith("https://") else f"{PLACES_BASE_URL}/{path}"
         try:
-            response = await self._http.get(
-                f"{PLACES_BASE_URL}/{path}", params={**params, "key": self._key}
-            )
+            response = await self._http.get(url, params={**params, "key": self._key})
         except httpx.HTTPError as exc:
             # The request URL carries the key; report the failure type only.
             raise MapsError(f"could not reach Google Maps ({type(exc).__name__})") from None
@@ -158,7 +234,7 @@ class GoogleMaps:
             raise MapsError(f"Google Maps returned HTTP {response.status_code}")
         body = response.json()
         status = body.get("status")
-        if status not in ("OK", "ZERO_RESULTS"):
+        if status not in ok:
             raise MapsError(f"Google Maps error {status}: {body.get('error_message', '')}"[:300])
         return body
 
@@ -174,6 +250,16 @@ class GoogleMaps:
             raise MapsError("Google Maps has no details for that place")
         return _details(place_id, result)
 
+    async def directions(self, origin: str, destination: str, mode: str) -> Route | None:
+        if mode not in TRAVEL_MODES:
+            raise MapsError(f"unsupported travel mode {mode!r}")
+        params = {"origin": origin, "destination": destination, "mode": mode}
+        if mode in ("driving", "transit"):
+            params["departure_time"] = "now"  # live traffic / next departures
+        # NOT_FOUND: an end couldn't be geocoded. Like ZERO_RESULTS, that's "no route".
+        body = await self._get(DIRECTIONS_URL, params, ok=("OK", "ZERO_RESULTS", "NOT_FOUND"))
+        return _route(mode, body) if body.get("status") == "OK" else None
+
 
 @dataclass
 class MockMaps:
@@ -181,8 +267,10 @@ class MockMaps:
 
     places: list[Place] = field(default_factory=list)
     details: dict[str, PlaceDetails] = field(default_factory=dict)
+    routes: dict[str, Route] = field(default_factory=dict)  # keyed by mode
     queries: list[str] = field(default_factory=list)
     detail_requests: list[str] = field(default_factory=list)
+    route_requests: list[tuple[str, str, str]] = field(default_factory=list)
 
     async def text_search(self, query: str) -> list[Place]:
         self.queries.append(query)
@@ -193,6 +281,10 @@ class MockMaps:
         if place_id not in self.details:
             raise MapsError("no details seeded for that place")
         return self.details[place_id]
+
+    async def directions(self, origin: str, destination: str, mode: str) -> Route | None:
+        self.route_requests.append((origin, destination, mode))
+        return self.routes.get(mode)
 
 
 def build_maps(config: MapsConfig | None = None) -> Maps:
