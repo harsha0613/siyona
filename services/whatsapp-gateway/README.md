@@ -18,8 +18,8 @@ Inbound WhatsApp handling and per-user session state.
 - `assistant.py` — the WhatsApp assistant: a tool-calling model loop for
   messages without a phone number. On when `OPENAI_API_KEY` is set.
 - `assistant_tools.py` — the assistant's tools (`set_user_location`,
-  `google_places`, `place_details`, `create_call_request`), same schema
-  contract as `voice-agent/tools.py`.
+  `google_places`, `place_details`, `create_call_request`, `get_directions`),
+  same schema contract as `voice-agent/tools.py`.
 - `POST /calls/report` (in `webhook.py`) — the voice agent's signed
   end-of-call report; the user gets the summary and the transcript.
 - `maps.py` — Google Maps boundary: `GoogleMaps` with `GOOGLE_MAPS_API_KEY`,

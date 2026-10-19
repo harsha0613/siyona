@@ -195,6 +195,25 @@ User:    Great, yes, book it for 5pm
 Siyona:  Before I call, please check: ...
 ```
 
+### `get_directions`
+
+Google Directions from the user's saved address (or a start they name) to
+"there" (the place last discussed), any place from the last search, or any
+address. Modes are driving (the default), walking, transit and bicycling.
+Returns the distance, the ETA (plus the ETA in current traffic when driving),
+and the first five route steps as plain text. Found places are routed by place
+id, which the user never sees. Requires `GOOGLE_MAPS_API_KEY`.
+
+```
+User:    How long to get there?
+Siyona:  Main Street Pharmacy is 1.2 mi away, about 6 min by car
+         (9 min in current traffic).
+         1. Head north on Main St (0.4 mi)
+         2. Turn right
+User:    And walking?
+Siyona:  1.1 mi, about 23 min on foot.
+```
+
 ## Tech stack
 
 | Layer | Choice | Why |

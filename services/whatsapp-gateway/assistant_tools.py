@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
-from maps import Maps, MapsError, Place, PlaceDetails
+from maps import TRAVEL_MODES, Maps, MapsError, Place, PlaceDetails, RouteStep
 from phone import PhoneNumberError, find_numbers, region_of, whatsapp_to_e164
 from session import Session
 from state_machine import MAX_ATTEMPTS_PER_NUMBER
@@ -340,6 +340,96 @@ async def create_call_request(
     }
 
 
+# ---------------------------------------------------------------------------
+# get_directions
+# ---------------------------------------------------------------------------
+
+GET_DIRECTIONS_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "destination": {
+            "type": "string",
+            "description": (
+                "Where to go: 'there' for the place last discussed, a place from the last "
+                "search (its number or name), or any address."
+            ),
+            "maxLength": MAX_LOCATION_CHARS,
+        },
+        "origin": {
+            "type": "string",
+            "description": "Where to start. Leave out to start from the user's saved address.",
+            "maxLength": MAX_LOCATION_CHARS,
+        },
+        "mode": {
+            "type": "string",
+            "description": "How the user travels. Use driving unless the user names a mode.",
+            "enum": list(TRAVEL_MODES),
+        },
+    },
+    "required": ["destination"],
+    "additionalProperties": False,
+}
+
+_THERE = {"there", "it", "them", "the store", "the place", "that place", "that store"}
+
+
+def _is_there(destination: str) -> bool:
+    return destination.lower().strip(" ?.!") in _THERE
+
+
+def _destination(session: Session, destination: str) -> tuple[str, str]:
+    """``(what to send Google, what to call it)``: found places go by place id."""
+    current = session.current_place
+    if current is not None and (
+        _is_there(destination) or destination.lower().strip() == current.name.lower()
+    ):
+        return f"place_id:{current.place_id}", current.name
+    if not _is_there(destination) and (found := resolve_place(session, destination)) is not None:
+        return f"place_id:{found.place_id}", found.name
+    return destination, destination
+
+
+def _step(step: RouteStep) -> str:
+    return f"{step.instruction} ({step.distance})" if step.distance else step.instruction
+
+
+async def get_directions(
+    ctx: ToolContext, destination: str, origin: str | None = None, mode: str = "driving"
+) -> dict[str, Any]:
+    """Distance, ETA and the first route steps, from the saved address by default."""
+    destination = _text(destination, "destination", MAX_LOCATION_CHARS)
+    if mode not in TRAVEL_MODES:
+        raise ToolError(f"mode must be one of {', '.join(TRAVEL_MODES)}")
+    start = _text(origin, "origin", MAX_LOCATION_CHARS) if origin else ctx.session.location
+    if not start:
+        return {
+            "status": "need_location",
+            "message": "No saved address. Ask the user where they're starting from.",
+        }
+    if _is_there(destination) and ctx.session.current_place is None:
+        return {"status": "need_destination", "message": "Ask the user where they want to go."}
+    target, label = _destination(ctx.session, destination)
+    try:
+        route = await ctx.maps.directions(start, target, mode)
+    except MapsError:
+        return {"status": "error", "message": "Directions are unavailable right now."}
+    if route is None:
+        return {"status": "no_route", "from": start, "to": label, "mode": mode}
+    result: dict[str, Any] = {
+        "status": "ok",
+        "from": route.start_address or start,
+        # A found place keeps its name; the id behind it never reaches the model.
+        "to": label if target.startswith("place_id:") else route.end_address or label,
+        "mode": mode,
+        "distance": route.distance,
+        "eta": route.duration,
+        "steps": [_step(step) for step in route.steps],
+    }
+    if route.duration_in_traffic and route.duration_in_traffic != route.duration:
+        result["eta_in_traffic"] = route.duration_in_traffic
+    return result
+
+
 ASSISTANT_TOOLS: tuple[AssistantTool, ...] = (
     AssistantTool(
         name="set_user_location",
@@ -378,6 +468,15 @@ ASSISTANT_TOOLS: tuple[AssistantTool, ...] = (
         ),
         parameters=CREATE_CALL_REQUEST_PARAMETERS,
         handler=create_call_request,
+    ),
+    AssistantTool(
+        name="get_directions",
+        description=(
+            "Distance, travel time (ETA) and route steps to a place, from the user's saved "
+            "address by default. Use for 'how far', 'how long to get there', 'directions'."
+        ),
+        parameters=GET_DIRECTIONS_PARAMETERS,
+        handler=get_directions,
     ),
 )
 
