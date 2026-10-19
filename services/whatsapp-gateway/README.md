@@ -15,6 +15,13 @@ Inbound WhatsApp handling and per-user session state.
 - `intake.py` / `phone.py` — rule-based parsing of the instruction; numbers come
   only from the user's text (libphonenumber).
 - `tasks.py` — the in-memory task store.
+- `assistant.py` — the WhatsApp assistant: a tool-calling model loop for
+  messages without a phone number. On when `OPENAI_API_KEY` is set.
+- `assistant_tools.py` — the assistant's tools (`set_user_location`,
+  `google_places`), same schema contract as `voice-agent/tools.py`.
+- `maps.py` — Google Maps boundary: `GoogleMaps` with `GOOGLE_MAPS_API_KEY`,
+  otherwise `MockMaps`.
+- `session.py` — per-user saved address, last Places results and history.
 - `messages.py` — every user-facing message text in one place.
 
 ```bash

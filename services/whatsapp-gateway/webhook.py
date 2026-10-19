@@ -31,10 +31,12 @@ from typing import Any
 from urllib.parse import parse_qsl
 
 import messages
+from assistant import Assistant, build_assistant
 from confirmation import ConfirmationGate, Dialer
 from dispatcher import CallDispatcher, signing_key_from_env
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from notifier import StatusNotifier
+from phone import PhoneNumberError, find_numbers, region_of, whatsapp_to_e164
 from tasks import TASK_STORE, Task, create_task, find_by_call_id
 from telephony import STATUS_CALLBACK_PATH, Telephony, TelephonyError, build_telephony
 from whatsapp import WhatsAppSender, build_whatsapp
@@ -134,6 +136,29 @@ def parse_message(payload: dict[str, Any]) -> tuple[str, str]:
     raise MessageParseError("no text message in payload")
 
 
+def _for_assistant(assistant: Assistant | None, sender: str, text: str) -> bool:
+    """Instructions that carry their own number keep the rule-based intake."""
+    if assistant is None:
+        return False
+    try:
+        region = region_of(whatsapp_to_e164(sender))
+    except PhoneNumberError:
+        region = None
+    return not find_numbers(text, region)
+
+
+async def _assist(assistant: Assistant, sender: WhatsAppSender, to: str, text: str) -> None:
+    try:
+        reply = await assistant.reply(to, text)
+    except Exception:
+        logger.exception("assistant failed")
+        reply = messages.ASSISTANT_UNAVAILABLE
+    try:
+        await sender.send_text(to, reply)
+    except Exception:
+        logger.exception("could not send assistant reply")
+
+
 async def _ask_to_clarify(sender: WhatsAppSender, to: str) -> bool:
     try:
         await sender.send_text(to, messages.CLARIFY)
@@ -167,13 +192,19 @@ async def receive_message(
 
     sender: WhatsAppSender = request.app.state.whatsapp
     gate: ConfirmationGate = request.app.state.gate
+    assistant: Assistant | None = request.app.state.assistant
     tasks: list[dict[str, Any]] = []
     replies = 0
+    assisted = 0
     clarified = 0
     for message in inbound:
         if message.error is None and message.sender and message.text:
             if await gate.handle_reply(message.sender, message.text):
                 replies += 1
+                continue
+            if _for_assistant(assistant, message.sender, message.text):
+                await _assist(assistant, sender, message.sender, message.text)
+                assisted += 1
                 continue
             task = create_task(message.sender, message.text)
             await gate.open(task)
@@ -187,6 +218,8 @@ async def receive_message(
         status = "accepted"
     elif replies:
         status = "reply_handled"
+    elif assisted:
+        status = "assistant_replied"
     else:
         status = "clarification_requested"
     return {"status": status, "tasks": tasks, "clarified": clarified}
@@ -233,6 +266,7 @@ def create_app(
     dialer: Dialer | None = None,
     confirmation_timeout_s: float | None = None,
     expected_call_window_s: float | None = None,
+    assistant: Assistant | None = None,
 ) -> FastAPI:
     sender = whatsapp or build_whatsapp()
     if dialer is None:
@@ -258,6 +292,7 @@ def create_app(
     application.state.gate = gate
     application.state.notifier = notifier
     application.state.telephony = telephony
+    application.state.assistant = assistant if assistant is not None else build_assistant()
     application.include_router(router)
     return application
 

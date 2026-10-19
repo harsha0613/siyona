@@ -108,6 +108,34 @@ The harness replays a YAML scenario against a stub agent, checks each required
 checkpoint and the expected outcome, and prints a pass/fail plus a latency
 score (the share of turns inside the per-turn budget).
 
+## WhatsApp assistant tools
+
+Messages that don't carry a phone number go to the WhatsApp assistant: a
+tool-calling model loop (`services/whatsapp-gateway/assistant.py`) that finds
+real businesses instead of guessing. Its prompt forbids made-up business names,
+addresses, phone numbers and ratings; every business it mentions must come from
+a tool result. It is on when `OPENAI_API_KEY` is set; without it the gateway
+keeps the rule-based intake. Maps calls go through `maps.py`, which falls back
+to `MockMaps` (finds nothing) while `GOOGLE_MAPS_API_KEY` is unset.
+
+### `set_user_location`
+
+Saves the user's address so "near me" searches have an origin. Needs no key.
+
+### `google_places`
+
+Google Places Text Search around the saved address (or an area the user
+names). Returns up to five results with name, address, rating and open-now.
+The place ids are kept in the user's session for follow-ups and never shown to
+the model or the user. Requires `GOOGLE_MAPS_API_KEY`.
+
+```
+User:    I'm at 950 Main St, Worcester MA. Find a pharmacy near me
+Siyona:  Here's what I found near you:
+         1. Main Street Pharmacy (4.6★, open now)
+         2. Park Avenue Drug (4.1★)
+```
+
 ## Tech stack
 
 | Layer | Choice | Why |
