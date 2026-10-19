@@ -18,10 +18,12 @@ Inbound WhatsApp handling and per-user session state.
 - `assistant.py` — the WhatsApp assistant: a tool-calling model loop for
   messages without a phone number. On when `OPENAI_API_KEY` is set.
 - `assistant_tools.py` — the assistant's tools (`set_user_location`,
-  `google_places`), same schema contract as `voice-agent/tools.py`.
+  `google_places`, `place_details`), same schema contract as
+  `voice-agent/tools.py`.
 - `maps.py` — Google Maps boundary: `GoogleMaps` with `GOOGLE_MAPS_API_KEY`,
   otherwise `MockMaps`.
-- `session.py` — per-user saved address, last Places results and history.
+- `session.py` — per-user saved address, last Places results, the place being
+  discussed, and history.
 - `messages.py` — every user-facing message text in one place.
 
 ```bash

@@ -234,7 +234,7 @@ def test_find_a_pharmacy_near_me_returns_places_results() -> None:
     assert "1. Main Street Pharmacy (4.6★)" in reply
     assert "2. Park Avenue Drug (4.1★)" in reply
     assert "ChIJ" not in reply
-    assert {t["function"]["name"] for t in model.tools} == {"set_user_location", "google_places"}
+    assert {"set_user_location", "google_places"} <= {t["function"]["name"] for t in model.tools}
 
 
 def test_saved_address_is_in_the_model_context() -> None:
