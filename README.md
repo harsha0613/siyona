@@ -154,6 +154,47 @@ User:    And Park Avenue Drug's number?
 Siyona:  Their phone number is not available on Google.
 ```
 
+### `create_call_request`
+
+Calls the store from the last `place_details` lookup on the user's behalf. The
+model never supplies a phone number: the tool dials the number Google lists for
+that place, and refuses if there isn't one. Before it runs, the assistant asks
+the 2-3 key questions for that kind of business. The call then goes through the
+same confirmation gate as a typed number (nothing is dialled until YES) and the
+Sprint 1 telephony interface and streaming pipeline.
+
+- The call context (task, the user's answers, their WhatsApp name and saved
+  address) is registered under the call id; the call opens with an AI
+  disclosure naming the user.
+- Busy, no answer or failed: the same task is redialled to the same number
+  after `CALL_RETRY_DELAY_S`, up to `MAX_ATTEMPTS_PER_NUMBER` attempts, and the
+  user is told each time.
+- The voice agent posts its outcome and transcript to `POST /calls/report`
+  (signed per call); the user gets the summary and the transcript on WhatsApp.
+- "Yes, book it" after a result places a confirmed follow-up call to the same
+  store with the updated details.
+
+Requires `GOOGLE_MAPS_API_KEY`, `OPENAI_API_KEY` and the `TELEPHONY_*`
+variables (the mock telephony is used without them).
+
+```
+User:    Call the first one and ask if they have amoxicillin
+Siyona:  Before I call: is the prescription under Asha K, and what strength?
+User:    Yes, 500 mg, pickup
+Siyona:  Before I call, please check:
+         • Who: Main Street Pharmacy on +1 508-555-0142
+         • What: Ask if they have amoxicillin 500 mg in stock for pickup
+         • I'll tell them: Customer name: Asha K. Medication: amoxicillin 500 mg.
+         • When: as soon as possible
+         Reply YES to call or NO to cancel.
+User:    YES
+Siyona:  📞 Calling now. I'll message you when I'm done.
+Siyona:  ✅ Done. Main Street Pharmacy has amoxicillin 500 mg in stock.
+Siyona:  📝 Transcript of Main Street Pharmacy: ...
+User:    Great, yes, book it for 5pm
+Siyona:  Before I call, please check: ...
+```
+
 ## Tech stack
 
 | Layer | Choice | Why |

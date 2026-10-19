@@ -1,7 +1,8 @@
 """Phone number helpers.
 
-Numbers are extracted deterministically with libphonenumber. The assistant only
-ever dials a number that appears in the user's own words.
+Numbers are extracted deterministically with libphonenumber. A dialled number
+either appears in the user's own words or is the one Google Places lists for a
+store the assistant found (see ``assistant_tools.dialable_number``).
 """
 
 from __future__ import annotations

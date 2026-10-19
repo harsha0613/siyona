@@ -3,6 +3,8 @@
 Rule-based and deterministic, so it runs with no model and no keys. One rule is
 non-negotiable: **every number we dial must appear in the user's own words.**
 Numbers are extracted with libphonenumber; nothing is inferred or looked up.
+The only other source is the WhatsApp assistant's ``create_call_request``: the
+number Google Places lists for a store it found, never one the model typed.
 """
 
 from __future__ import annotations

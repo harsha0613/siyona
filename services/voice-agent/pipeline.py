@@ -18,6 +18,11 @@ Streaming, stage by stage:
   complete.
 * **Teardown is total.** However the call ends (hang-up, error, cancellation),
   every in-flight model stream, TTS stream, timer and vendor socket is closed.
+* **The call opens with a disclosure.** An ``opening_line`` (the AI disclosure
+  for a real call) is spoken before the callee's first turn.
+* **Tools end the call.** When ``tools`` are passed, the model may call them;
+  ``end_call`` records the outcome and stops the loop, and ``transcript()``
+  returns the whole conversation for the report back to the user.
 * **No dead air on a vendor stall.** If no reply audio has gone out
   ``STALL_FILLER_MS`` after the final transcript, a short filler ("One moment,
   please.") is played from audio synthesised at call start, so it works even
@@ -39,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -47,6 +53,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import tools as call_tools
 from latency import (
     TARGET_TURN_LATENCY_MS,
     StageTimings,
@@ -149,15 +156,23 @@ def normalise(text: str) -> str:
 class _Generation:
     """One model request, drained into a queue so it can run ahead of its consumer."""
 
-    def __init__(self, llm: LanguageModel, messages: list[dict[str, Any]], text: str) -> None:
+    def __init__(
+        self,
+        llm: LanguageModel,
+        messages: list[dict[str, Any]],
+        text: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.text = text
         self.key = normalise(text)
         self._queue: asyncio.Queue[LlmEvent | BaseException | None] = asyncio.Queue()
-        self._task = asyncio.create_task(self._pump(llm, messages))
+        self._task = asyncio.create_task(self._pump(llm, messages, tools or []))
 
-    async def _pump(self, llm: LanguageModel, messages: list[dict[str, Any]]) -> None:
+    async def _pump(
+        self, llm: LanguageModel, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> None:
         try:
-            async with contextlib.aclosing(llm.stream(messages, [])) as events:  # type: ignore[type-var]
+            async with contextlib.aclosing(llm.stream(messages, tools)) as events:  # type: ignore[type-var]
                 async for event in events:
                     self._queue.put_nowait(event)
         except asyncio.CancelledError:
@@ -200,6 +215,12 @@ class CallPipeline:
     clock: Callable[[], float] = time.perf_counter
     history: list[dict[str, Any]] = field(default_factory=list)
     turns: list[TurnResult] = field(default_factory=list)
+    # Spoken before the callee's first turn; on a real call, the AI disclosure.
+    opening_line: str | None = None
+    # Tool definitions offered to the model. Empty means tools are off.
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    # Set by end_call: {"status": "ended", "reason": ..., "outcome_summary": ...}.
+    ended: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self._speculation: _Generation | None = None
@@ -214,15 +235,49 @@ class CallPipeline:
         try:
             await asyncio.gather(self.stt.start(), self.tts.start())
             self._filler_task = asyncio.create_task(self._prepare_filler())
+            if self.opening_line:
+                await self._open()
             async with contextlib.aclosing(self.stt.events()) as events:  # type: ignore[type-var]
                 async for event in events:
                     if event.kind == "interim":
                         self._on_interim(event.text)
                     elif event.kind == "final" and event.text.strip():
                         await self._respond(event.text.strip(), event.speech_ended_at)
+                        if self.ended is not None:
+                            break
         finally:
             await self.aclose()
         return self.turns
+
+    async def _open(self) -> None:
+        assert self.opening_line is not None
+        audio = await self._synthesize(self.opening_line)
+        if audio:
+            await self.audio_out.send_audio(audio)
+        self.history.append({"role": "assistant", "content": self.opening_line})
+
+    def transcript(self) -> list[tuple[str, str]]:
+        """The conversation so far as ``(speaker, text)``, speaker ``agent`` or ``callee``."""
+        lines = [("agent", self.opening_line)] if self.opening_line else []
+        for turn in self.turns:
+            lines.append(("callee", turn.caller_text))
+            if turn.agent_text:
+                lines.append(("agent", turn.agent_text))
+        return lines
+
+    def _run_tool(self, request: ToolCallRequest) -> None:
+        if not self.tools:
+            logger.warning("model requested tool %s; tools are not enabled", request.name)
+            return
+        try:
+            arguments = json.loads(request.arguments or "{}")
+            result = call_tools.dispatch(request.name, arguments)
+        except (call_tools.ToolError, TypeError, ValueError) as exc:
+            logger.warning("tool %s rejected: %s", request.name, exc)
+            return
+        logger.info("tool %s ran", request.name)
+        if request.name == "end_call":
+            self.ended = result
 
     def _messages(self, caller_text: str) -> list[dict[str, Any]]:
         return [
@@ -249,7 +304,7 @@ class CallPipeline:
         if self._speculation is not None and self._speculation.key == normalise(text):
             return
         await self._drop_speculation()
-        self._speculation = _Generation(self.llm, self._messages(text), text)
+        self._speculation = _Generation(self.llm, self._messages(text), text, self.tools)
         logger.debug("speculating on %d interim words", len(text.split()))
 
     async def _drop_speculation(self) -> None:
@@ -271,7 +326,7 @@ class CallPipeline:
             return speculation, True
         if speculation is not None:
             await speculation.cancel()
-        return _Generation(self.llm, self._messages(caller_text), caller_text), False
+        return _Generation(self.llm, self._messages(caller_text), caller_text, self.tools), False
 
     # ------------------------------------------------------------------ turn
 
@@ -297,7 +352,7 @@ class CallPipeline:
                     for chunk in chunker.feed(event.text):
                         hand_to_tts(chunk)
                 elif isinstance(event, ToolCallRequest):
-                    logger.warning("model requested tool %s; tools are not enabled", event.name)
+                    self._run_tool(event)
                 elif isinstance(event, UsageReport):
                     pass
             tail = chunker.flush()

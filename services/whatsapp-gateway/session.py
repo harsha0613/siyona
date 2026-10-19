@@ -20,6 +20,8 @@ MAX_HISTORY_MESSAGES = 20
 class Session:
     user_phone: str
     location: str | None = None
+    # The WhatsApp profile name, used to say who Siyona is calling for.
+    user_name: str | None = None
     places: list[Place] = field(default_factory=list)
     # The place last looked up with place_details: what "them" and "there" refer to.
     current_place: PlaceDetails | None = None
@@ -28,6 +30,21 @@ class Session:
     def remember(self, user_text: str, reply: str) -> None:
         self.history.extend(
             [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}]
+        )
+        del self.history[:-MAX_HISTORY_MESSAGES]
+
+    # The last call this user made through the assistant, for "yes, book it" follow-ups.
+    last_call_task_id: str | None = None
+    last_call_place_id: str | None = None
+
+    def note_call(
+        self, task_id: str, place_id: str | None, callee: str | None, summary: str
+    ) -> None:
+        """Put a finished call's outcome into the conversation so follow-ups can use it."""
+        self.last_call_task_id, self.last_call_place_id = task_id, place_id
+        who = callee or "the store"
+        self.history.append(
+            {"role": "assistant", "content": f"(Call to {who} finished: {summary})"}
         )
         del self.history[:-MAX_HISTORY_MESSAGES]
 

@@ -17,6 +17,9 @@ to end.
   `factory.py` picks live or mock per stage from the environment (mock when
   the key is unset or a placeholder).
 - `telephony.py` — the telephony provider boundary (Twilio + mock).
+- `call_context.py` — what a call knows (task, the user's details, name and
+  location), the AI-disclosure opening line, the call prompt, and `run_call`,
+  which runs the pipeline with the call tools and returns the outcome report.
 - `tools.py` — `send_dtmf` and `end_call`, the reference tools that pin the
   tool-layer contract.
 
